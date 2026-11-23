@@ -50,8 +50,9 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
         port = srv.server_address[1]
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
+            with opener.open(f"http://127.0.0.1:{port}/health", timeout=5) as resp:
                 health = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(health["status"], "ok")
                 self.assertEqual(health["protocol"], "2025-11-25")
@@ -68,7 +69,7 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
                 ).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=5) as mresp:
+            with opener.open(req, timeout=5) as mresp:
                 body = json.loads(mresp.read().decode("utf-8"))
                 self.assertEqual(body["id"], 42)
                 inner = json.loads(body["result"]["content"][0]["text"])
