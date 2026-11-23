@@ -5,6 +5,7 @@ from .engine import (
     McpJsonRpcDispatcher,
     OtlpTelemetryExporter,
     RedactionGuard,
+    SearchHit,
     SparseTop2MoeRouter,
 )
 
@@ -13,6 +14,7 @@ __all__ = [
     "McpJsonRpcDispatcher",
     "OtlpTelemetryExporter",
     "RedactionGuard",
+    "SearchHit",
     "SparseTop2MoeRouter",
 ]
-__version__ = "1.1.0"
+__version__ = "1.2.0"

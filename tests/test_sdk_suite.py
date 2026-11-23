@@ -91,9 +91,143 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
                 self.assertEqual(otlp["summary"]["cache_hits"], 1)
                 self.assertEqual(otlp["summary"]["cache_misses"], 1)
                 self.assertGreaterEqual(len(otlp["resourceSpans"][0]["scopeSpans"][0]["spans"]), 2)
+
+            init_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 43,
+                        "method": "initialize",
+                        "params": {"protocolVersion": "2025-11-25", "capabilities": {"sampling": {}}},
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with opener.open(init_req, timeout=5) as iresp:
+                init_body = json.loads(iresp.read().decode("utf-8"))["result"]
+                self.assertEqual(init_body["serverInfo"]["version"], "1.2.0")
+                self.assertIn("resources", init_body["capabilities"])
+                self.assertIn("prompts", init_body["capabilities"])
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_fts5_highlighted_citation_spans_and_xss_safety(self) -> None:
+        vault = HybridKnowledgeVault(":memory:")
+        doc_body = "SQLite WAL <script>alert(1)</script> fuses BM25 lexical rankings with cosine RRF vectors."
+        vault.upsert("cite-1", "FTS5 Citation Engine", doc_body, ["fts5", "citations"])
+        vault.upsert("cite-2", "Pure Dense Orthogonal Note", "Unrelated memory allocator slab geometry.", ["os"])
+
+        hits = vault.hybrid_search("BM25 RRF Citation", top_k=2)
+        top = hits[0]
+        self.assertEqual(top.doc_id, "cite-1")
+        self.assertIn("<mark>BM25</mark>", top.highlighted_snippet)
+        self.assertIn("<mark>RRF</mark>", top.highlighted_snippet)
+        self.assertNotIn("<script>", top.highlighted_snippet)
+        self.assertIn("&lt;script&gt;", top.highlighted_snippet)
+
+        clean_body, _ = RedactionGuard.sanitize(doc_body)
+        body_spans = [s for s in top.citation_spans if s["field"] == "body"]
+        title_spans = [s for s in top.citation_spans if s["field"] == "title"]
+        self.assertGreaterEqual(len(body_spans), 2)
+        self.assertEqual(len(title_spans), 1)
+        for sp in body_spans:
+            self.assertEqual(clean_body[sp["start"] : sp["end"]].lower(), sp["term"].lower())
+        for sp in title_spans:
+            self.assertEqual("FTS5 Citation Engine"[sp["start"] : sp["end"]].lower(), sp["term"].lower())
+
+        # Unmatched lexical hit falls back cleanly with empty citation_spans
+        self.assertIsNone(hits[1].lexical_rank)
+        self.assertEqual(len(hits[1].citation_spans), 0)
+
+    def test_mcp_capability_negotiation_and_resources_lifecycle(self) -> None:
+        vault = HybridKnowledgeVault(":memory:")
+        vault.upsert("res-doc-1", "Zero-Leak Security Spec", "Strips sk-abcdefghijklmnopqrstuvwx tokens.", ["sec"])
+        disp = McpJsonRpcDispatcher(vault=vault)
+        disp.register_resource(
+            "mcp://custom/build-info",
+            "SDK Build Matrix",
+            "Deterministic build metadata.",
+            lambda: {"sdk": "mcp-moe-hybrid-sdk", "deterministic": True},
+        )
+
+        # Supported older protocol version negotiates cleanly; unknown version falls back to latest 2025-11-25
+        init_compat = disp.handle(
+            {"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {"roots": {}}}}
+        )["result"]
+        self.assertEqual(init_compat["protocolVersion"], "2024-11-05")
+        self.assertIn("roots", disp.negotiated_client_capabilities)
+
+        init_fallback = disp.handle(
+            {"jsonrpc": "2.0", "id": 11, "method": "initialize", "params": {"protocolVersion": "1999-01-01"}}
+        )["result"]
+        self.assertEqual(init_fallback["protocolVersion"], "2025-11-25")
+        self.assertEqual(set(init_fallback["capabilities"].keys()), {"tools", "resources", "prompts"})
+
+        res_list = disp.handle({"jsonrpc": "2.0", "id": 12, "method": "resources/list"})["result"]["resources"]
+        uris = {r["uri"] for r in res_list}
+        self.assertIn("mcp://moe-router/tiers", uris)
+        self.assertIn("mcp://telemetry/otlp", uris)
+        self.assertIn("mcp://custom/build-info", uris)
+        self.assertIn("vault://documents/res-doc-1", uris)
+
+        tmpl_list = disp.handle({"jsonrpc": "2.0", "id": 13, "method": "resources/templates/list"})["result"]["resourceTemplates"]
+        self.assertEqual(tmpl_list[0]["uriTemplate"], "vault://documents/{doc_id}")
+
+        doc_read = disp.handle(
+            {"jsonrpc": "2.0", "id": 14, "method": "resources/read", "params": {"uri": "vault://documents/res-doc-1"}}
+        )["result"]["contents"][0]
+        parsed_doc = json.loads(doc_read["text"])
+        self.assertEqual(parsed_doc["doc_id"], "res-doc-1")
+        self.assertEqual(parsed_doc["redactions"], 1)
+        self.assertIn("[REDACTED_API_KEY]", parsed_doc["body"])
+
+        missing = disp.handle(
+            {"jsonrpc": "2.0", "id": 15, "method": "resources/read", "params": {"uri": "vault://documents/nonexistent"}}
+        )
+        self.assertEqual(missing["error"]["code"], -32002)
+
+    def test_mcp_prompts_list_and_grounded_prompt_rendering(self) -> None:
+        vault = HybridKnowledgeVault(":memory:")
+        vault.upsert("prm-1", "SQLite WAL Checkpointing", "WAL frames flush sequentially with FTS5 BM25.", ["sqlite"])
+        disp = McpJsonRpcDispatcher(vault=vault)
+
+        plist = disp.handle({"jsonrpc": "2.0", "id": 20, "method": "prompts/list"})["result"]["prompts"]
+        pnames = {p["name"] for p in plist}
+        self.assertIn("grounded_rag_answer", pnames)
+        self.assertIn("moe_sla_routing_plan", pnames)
+
+        grounded = disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "prompts/get",
+                "params": {"name": "grounded_rag_answer", "arguments": {"query": "FTS5 BM25 user@corp.io", "top_k": 1}},
+            }
+        )["result"]
+        msg_txt = grounded["messages"][0]["content"]["text"]
+        self.assertIn("[prm-1]", msg_txt)
+        self.assertIn("<mark>FTS5</mark>", msg_txt)
+        self.assertNotIn("user@corp.io", msg_txt)
+
+        plan = disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "prompts/get",
+                "params": {
+                    "name": "moe_sla_routing_plan",
+                    "arguments": {"task": "Prove Black-Scholes convexity theorem", "max_vram_gib": 6.0, "latency_sla_ms": 1200},
+                },
+            }
+        )["result"]
+        self.assertIn("frontier_moe_math_architect", plan["messages"][0]["content"]["text"])
+
+        err_missing = disp.handle(
+            {"jsonrpc": "2.0", "id": 23, "method": "prompts/get", "params": {"name": "grounded_rag_answer", "arguments": {}}}
+        )
+        self.assertEqual(err_missing["error"]["code"], -32602)
 
     def test_otlp_span_hook_histogram_and_cache_invalidation(self) -> None:
         captured_spans: list[dict] = []

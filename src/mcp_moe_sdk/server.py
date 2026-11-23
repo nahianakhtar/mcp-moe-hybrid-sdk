@@ -30,8 +30,8 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="card full">
-    <h1>mcp-moe-hybrid-sdk v1.1.0</h1>
-    <div style="color:var(--muted)">MCP 2025-11-25 JSON-RPC 2.0 &bull; Sparse Top-2 MoE SLA Router &bull; SQLite WAL FTS5 + Vector RRF &bull; OTLP JSON Telemetry</div>
+    <h1>mcp-moe-hybrid-sdk v1.2.0</h1>
+    <div style="color:var(--muted)">MCP 2025-11-25 (Tools &bull; Resources &bull; Prompts) &bull; Sparse Top-2 MoE SLA Router &bull; SQLite WAL FTS5 Highlighted RRF &bull; OTLP JSON Telemetry</div>
   </div>
   <div class="card">
     <h2>1. Sparse Top-2 MoE Router</h2>
@@ -40,21 +40,37 @@ DASHBOARD_HTML = """<!doctype html>
     <pre id="rout">Ready.</pre>
   </div>
   <div class="card">
-    <h2>2. SQLite FTS5 + Vector RRF Search</h2>
+    <h2>2. SQLite FTS5 Highlighted + Vector RRF Search</h2>
     <input id="q" value="MCP JSON-RPC protocol hybrid retrieval"/>
     <button onclick="runSearch()">Hybrid Search</button>
     <pre id="sout">Ready.</pre>
   </div>
+  <div class="card full">
+    <h2>3. MCP 2025-11-25 Capability Negotiation (resources/list &amp; prompts/list)</h2>
+    <button onclick="runCaps()">Inspect Negotiated Capabilities, Resources &amp; Prompts</button>
+    <pre id="cout">Ready.</pre>
+  </div>
 </div>
 <script>
-async function mcpCall(name, args){
+async function mcpRpc(method, params={}){
   const r = await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:args}})});
-  const j = await r.json();
-  return JSON.parse(j.result.content[0].text);
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
+  return (await r.json()).result;
+}
+async function mcpCall(name, args){
+  const res = await mcpRpc('tools/call',{name,arguments:args});
+  return JSON.parse(res.content[0].text);
 }
 async function runRoute(){ document.getElementById('rout').textContent = JSON.stringify(await mcpCall('moe_route_query',{prompt:document.getElementById('p').value}),null,2); }
 async function runSearch(){ document.getElementById('sout').textContent = JSON.stringify(await mcpCall('rag_hybrid_search',{query:document.getElementById('q').value,top_k:3}),null,2); }
+async function runCaps(){
+  const [init, resources, prompts] = await Promise.all([
+    mcpRpc('initialize',{protocolVersion:'2025-11-25',capabilities:{roots:{listChanged:false}}}),
+    mcpRpc('resources/list'),
+    mcpRpc('prompts/list')
+  ]);
+  document.getElementById('cout').textContent = JSON.stringify({initialize:init,resources:resources.resources,prompts:prompts.prompts},null,2);
+}
 </script>
 </body>
 </html>"""
