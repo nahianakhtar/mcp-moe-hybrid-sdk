@@ -6,7 +6,9 @@ from .engine import (
     OtlpTelemetryExporter,
     RedactionGuard,
     SearchHit,
+    SlidingWindowTokenRateLimiter,
     SparseTop2MoeRouter,
+    estimate_mcp_tokens,
 )
 
 __all__ = [
@@ -15,6 +17,8 @@ __all__ = [
     "OtlpTelemetryExporter",
     "RedactionGuard",
     "SearchHit",
+    "SlidingWindowTokenRateLimiter",
     "SparseTop2MoeRouter",
+    "estimate_mcp_tokens",
 ]
-__version__ = "1.2.0"
+__version__ = "1.3.0"

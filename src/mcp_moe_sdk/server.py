@@ -6,7 +6,13 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .engine import HybridKnowledgeVault, McpJsonRpcDispatcher, SparseTop2MoeRouter
+from .engine import (
+    HybridKnowledgeVault,
+    McpJsonRpcDispatcher,
+    SlidingWindowTokenRateLimiter,
+    SparseTop2MoeRouter,
+    estimate_mcp_tokens,
+)
 
 DASHBOARD_HTML = """<!doctype html>
 <html lang="en">
@@ -30,8 +36,8 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="card full">
-    <h1>mcp-moe-hybrid-sdk v1.2.0</h1>
-    <div style="color:var(--muted)">MCP 2025-11-25 (Tools &bull; Resources &bull; Prompts) &bull; Sparse Top-2 MoE SLA Router &bull; SQLite WAL FTS5 Highlighted RRF &bull; OTLP JSON Telemetry</div>
+    <h1>mcp-moe-hybrid-sdk v1.3.0</h1>
+    <div style="color:var(--muted)">MCP 2025-11-25 Streamable HTTP Batching &bull; W3C traceparent OTLP Spans &bull; X-RateLimit-* Token Governance &bull; Sparse Top-2 MoE &bull; SQLite WAL FTS5 RRF</div>
   </div>
   <div class="card">
     <h2>1. Sparse Top-2 MoE Router</h2>
@@ -45,10 +51,15 @@ DASHBOARD_HTML = """<!doctype html>
     <button onclick="runSearch()">Hybrid Search</button>
     <pre id="sout">Ready.</pre>
   </div>
-  <div class="card full">
-    <h2>3. MCP 2025-11-25 Capability Negotiation (resources/list &amp; prompts/list)</h2>
-    <button onclick="runCaps()">Inspect Negotiated Capabilities, Resources &amp; Prompts</button>
+  <div class="card">
+    <h2>3. MCP 2025-11-25 Capability Negotiation</h2>
+    <button onclick="runCaps()">Inspect Negotiated Capabilities</button>
     <pre id="cout">Ready.</pre>
+  </div>
+  <div class="card">
+    <h2>4. Streamable JSON-RPC 2.0 Batch + W3C traceparent &amp; Rate-Limit Headers</h2>
+    <button onclick="runBatch()">Execute Atomic Batch + Inspect Governance Headers</button>
+    <pre id="bout">Ready.</pre>
   </div>
 </div>
 <script>
@@ -71,12 +82,26 @@ async function runCaps(){
   ]);
   document.getElementById('cout').textContent = JSON.stringify({initialize:init,resources:resources.resources,prompts:prompts.prompts},null,2);
 }
+async function runBatch(){
+  const tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+  const batch = [
+    {jsonrpc:'2.0',method:'notifications/initialized'},
+    {jsonrpc:'2.0',id:101,method:'tools/call',params:{name:'moe_route_query',arguments:{prompt:'Verify SQLite WAL FTS5 RRF'}}},
+    {jsonrpc:'2.0',id:102,method:'tools/call',params:{name:'rag_hybrid_search',arguments:{query:'Streamable JSON-RPC',top_k:1}}}
+  ];
+  const r = await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json','traceparent':tp},body:JSON.stringify(batch)});
+  const headers = {};
+  for (const k of ['traceparent','X-RateLimit-Limit-Requests','X-RateLimit-Remaining-Requests','X-RateLimit-Limit-Tokens','X-RateLimit-Remaining-Tokens','X-RateLimit-Reset-Ms']){
+    headers[k] = r.headers.get(k);
+  }
+  document.getElementById('bout').textContent = JSON.stringify({status:r.status,headers,batchResponses:await r.json()},null,2);
+}
 </script>
 </body>
 </html>"""
 
 
-def create_seeded_dispatcher() -> McpJsonRpcDispatcher:
+def create_seeded_dispatcher(*, max_batch_size: int = 32) -> McpJsonRpcDispatcher:
     vault = HybridKnowledgeVault(":memory:")
     vault.upsert(
         "arch-mcp-2025",
@@ -96,23 +121,68 @@ def create_seeded_dispatcher() -> McpJsonRpcDispatcher:
         "Routes requests dynamically across edge Q8 Vulkan slots and 20B hybrid CPU/GPU MoE tiers under VRAM budgets.",
         ["moe", "routing", "vram", "latency"],
     )
-    return McpJsonRpcDispatcher(vault=vault, router=SparseTop2MoeRouter())
+    return McpJsonRpcDispatcher(vault=vault, router=SparseTop2MoeRouter(), max_batch_size=max_batch_size)
 
 
-def build_server(host: str = "127.0.0.1", port: int = 8090) -> ThreadingHTTPServer:
-    dispatcher = create_seeded_dispatcher()
+def build_server(
+    host: str = "127.0.0.1",
+    port: int = 8090,
+    *,
+    rate_limiter: SlidingWindowTokenRateLimiter | None = None,
+    max_batch_size: int = 32,
+) -> ThreadingHTTPServer:
+    dispatcher = create_seeded_dispatcher(max_batch_size=max_batch_size)
+    limiter = rate_limiter or SlidingWindowTokenRateLimiter()
+    dispatcher.register_resource(
+        "mcp://governance/ratelimit",
+        "Sliding-Window Token-Budget Rate Limiter",
+        "Live per-client sliding-window request/token counters and active bucket snapshot.",
+        limiter.snapshot,
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
-        def _send_json(self, code: int, obj: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            code: int,
+            obj: dict[str, Any] | list[dict[str, Any]],
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             raw = json.dumps(obj).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            for hk, hv in (extra_headers or {}).items():
+                self.send_header(hk, hv)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def _send_empty(self, code: int, *, extra_headers: dict[str, str] | None = None) -> None:
+            self.send_response(code)
+            for hk, hv in (extra_headers or {}).items():
+                self.send_header(hk, hv)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _send_sse(
+            self,
+            obj: dict[str, Any] | list[dict[str, Any]],
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
+            events = obj if isinstance(obj, list) else [obj]
+            frames = "".join(f"event: message\ndata: {json.dumps(ev)}\n\n" for ev in events).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            for hk, hv in (extra_headers or {}).items():
+                self.send_header(hk, hv)
+            self.send_header("Content-Length", str(len(frames)))
+            self.end_headers()
+            self.wfile.write(frames)
 
         def do_GET(self) -> None:
             if self.path == "/health":
@@ -120,30 +190,94 @@ def build_server(host: str = "127.0.0.1", port: int = 8090) -> ThreadingHTTPServ
                     200,
                     {
                         "status": "ok",
+                        "version": "1.3.0",
                         "protocol": dispatcher.PROTOCOL_VERSION,
                         "documents": dispatcher.vault.count(),
                         "router": dispatcher.router.stats(),
                         "telemetry": dispatcher.telemetry.export_otlp_json()["summary"],
+                        "rate_limit": limiter.snapshot(),
                     },
                 )
                 return
             if self.path == "/metrics/otlp":
                 self._send_json(200, dispatcher.telemetry.export_otlp_json())
                 return
-            html = DASHBOARD_HTML.encode("utf-8")
+            html_bytes = DASHBOARD_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
+            self.send_header("Content-Length", str(len(html_bytes)))
             self.end_headers()
-            self.wfile.write(html)
+            self.wfile.write(html_bytes)
 
         def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-            if self.path == "/mcp":
-                self._send_json(200, dispatcher.handle(body))
-            else:
+            length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+            raw_bytes = self.rfile.read(length) if length > 0 else b""
+            if self.path != "/mcp":
                 self._send_json(404, {"error": "Not found"})
+                return
+
+            incoming_tp = self.headers.get("traceparent")
+            client_id = (
+                self.headers.get("X-Client-Id")
+                or (self.client_address[0] if self.client_address else None)
+                or "anonymous"
+            )
+
+            try:
+                body = json.loads(raw_bytes.decode("utf-8") if raw_bytes else "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                gw_ctx = dispatcher.telemetry.new_gateway_context(incoming_tp)
+                decision = limiter.consume(client_id, 1)
+                dispatcher.telemetry.record_rate_limit_decision(decision["allowed"])
+                hdrs = {**limiter.to_headers(decision), "traceparent": gw_ctx["traceparent"]}
+                self._send_json(
+                    400,
+                    {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error: invalid JSON payload"}},
+                    extra_headers=hdrs,
+                )
+                return
+
+            est_tokens = estimate_mcp_tokens(body)
+            decision = limiter.consume(client_id, est_tokens)
+            dispatcher.telemetry.record_rate_limit_decision(decision["allowed"])
+            rl_headers = limiter.to_headers(decision)
+
+            if not decision["allowed"]:
+                gw_ctx = dispatcher.telemetry.new_gateway_context(incoming_tp)
+                req_id = body.get("id") if isinstance(body, dict) else None
+                self._send_json(
+                    429,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32029,
+                            "message": "Rate limit exceeded",
+                            "data": {
+                                "reason": decision["reason"],
+                                "retryAfterMs": decision["retry_after_ms"],
+                                "requestedTokens": decision["requested_tokens"],
+                            },
+                        },
+                    },
+                    extra_headers={**rl_headers, "traceparent": gw_ctx["traceparent"]},
+                )
+                return
+
+            status_code, resp_obj, resp_tp = dispatcher.handle_http_payload(body, traceparent=incoming_tp)
+            out_headers = {**rl_headers, "traceparent": resp_tp}
+
+            if status_code == 202 or resp_obj is None:
+                self._send_empty(202, extra_headers=out_headers)
+                return
+
+            accept_hdr = (self.headers.get("Accept") or "").lower()
+            wants_sse = "text/event-stream" in accept_hdr and "application/json" not in accept_hdr
+            if status_code == 200 and wants_sse:
+                self._send_sse(resp_obj, extra_headers=out_headers)
+                return
+
+            self._send_json(status_code, resp_obj, extra_headers=out_headers)
 
     return ThreadingHTTPServer((host, port), Handler)
 

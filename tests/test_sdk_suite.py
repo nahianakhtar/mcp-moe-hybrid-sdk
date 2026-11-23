@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.error
 import urllib.request
 import unittest
 
@@ -12,7 +13,9 @@ from mcp_moe_sdk.engine import (
     McpJsonRpcDispatcher,
     OtlpTelemetryExporter,
     RedactionGuard,
+    SlidingWindowTokenRateLimiter,
     SparseTop2MoeRouter,
+    estimate_mcp_tokens,
 )
 from mcp_moe_sdk.server import build_server
 
@@ -106,7 +109,7 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
             )
             with opener.open(init_req, timeout=5) as iresp:
                 init_body = json.loads(iresp.read().decode("utf-8"))["result"]
-                self.assertEqual(init_body["serverInfo"]["version"], "1.2.0")
+                self.assertEqual(init_body["serverInfo"]["version"], "1.3.0")
                 self.assertIn("resources", init_body["capabilities"])
                 self.assertIn("prompts", init_body["capabilities"])
         finally:
@@ -278,6 +281,242 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
         metrics = otlp["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
         self.assertEqual(metrics[0]["name"], "mcp.tool.duration")
         self.assertGreaterEqual(len(metrics[0]["histogram"]["dataPoints"]), 2)
+
+    def test_w3c_traceparent_parsing_and_otlp_span_propagation(self) -> None:
+        valid_tp = "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01"
+        parsed = OtlpTelemetryExporter.parse_traceparent(valid_tp)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["trace_id"], "4bf92f3577b34da6a3ce929d0e0e4736")
+        self.assertEqual(parsed["parent_span_id"], "00f067aa0ba902b7")
+        self.assertEqual(parsed["trace_flags"], "01")
+
+        # Reject all-zero trace_id or parent_span_id and malformed headers per W3C Trace Context Level 1
+        self.assertIsNone(OtlpTelemetryExporter.parse_traceparent("00-" + "0" * 32 + "-00f067aa0ba902b7-01"))
+        self.assertIsNone(OtlpTelemetryExporter.parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-" + "0" * 16 + "-01"))
+        self.assertIsNone(OtlpTelemetryExporter.parse_traceparent("99-invalid"))
+
+        captured: list[dict] = []
+        disp = McpJsonRpcDispatcher(telemetry=OtlpTelemetryExporter(span_hook=captured.append))
+        disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 301,
+                "method": "tools/call",
+                "params": {"name": "moe_route_query", "arguments": {"prompt": "Emit JSON health ping"}},
+            },
+            traceparent=valid_tp,
+        )
+        disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 302,
+                "method": "tools/call",
+                "params": {
+                    "name": "moe_route_query",
+                    "arguments": {"prompt": "Prove convexity theorem"},
+                    "_meta": {"traceparent": "00-11112222333344445555666677778888-aaaabbbbccccdddd-00"},
+                },
+            }
+        )
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0]["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736")
+        self.assertEqual(captured[0]["parentSpanId"], "00f067aa0ba902b7")
+        self.assertEqual(captured[0]["traceFlags"], 1)
+        self.assertEqual(captured[1]["traceId"], "11112222333344445555666677778888")
+        self.assertEqual(captured[1]["parentSpanId"], "aaaabbbbccccdddd")
+        self.assertEqual(captured[1]["traceFlags"], 0)
+
+    def test_sliding_window_token_rate_limiter_invariants_and_headers(self) -> None:
+        clock_ms = [1_000]
+        limiter = SlidingWindowTokenRateLimiter(
+            window_ms=10_000,
+            max_requests_per_window=3,
+            max_tokens_per_window=20,
+            max_tracked_clients=2,
+            now_fn=lambda: clock_ms[0],
+        )
+
+        d1 = limiter.consume("client-a", 12)
+        self.assertTrue(d1["allowed"])
+        self.assertEqual(d1["remaining_requests"], 2)
+        self.assertEqual(d1["remaining_tokens"], 8)
+        h1 = limiter.to_headers(d1)
+        self.assertEqual(h1["X-RateLimit-Remaining-Tokens"], "8")
+        self.assertNotIn("Retry-After", h1)
+
+        clock_ms[0] = 3_500
+        d2 = limiter.consume("client-a", 10)
+        self.assertFalse(d2["allowed"])
+        self.assertEqual(d2["reason"], "sliding_window_tokens_exceeded")
+        # First entry (12 tokens at t=1000) expires at t=11000 -> 7500 ms remaining -> Retry-After = ceil(7.5) = 8s
+        self.assertEqual(d2["retry_after_ms"], 7_500)
+        h2 = limiter.to_headers(d2)
+        self.assertEqual(h2["Retry-After"], "8")
+
+        # Non-penalizing rejection: advancing past t=11000 frees the 12-token entry cleanly
+        clock_ms[0] = 11_001
+        d3 = limiter.consume("client-a", 10)
+        self.assertTrue(d3["allowed"])
+        self.assertEqual(d3["used_tokens"], 10)
+
+        # Bounded LRU client eviction keeps active_clients <= max_tracked_clients (2)
+        limiter.consume("client-b", 2)
+        limiter.consume("client-c", 2)
+        snap = limiter.snapshot()
+        self.assertLessEqual(snap["active_clients"], 2)
+        self.assertEqual(snap["total_allowed"], 4)
+        self.assertEqual(snap["total_rejected"], 1)
+
+    def test_mcp_jsonrpc_batch_notifications_and_error_isolation(self) -> None:
+        disp = McpJsonRpcDispatcher(max_batch_size=4)
+        batch = [
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            "malformed-item",
+            {"jsonrpc": "2.0", "id": 2, "method": "unknown/method"},
+        ]
+        status, responses, resp_tp = disp.handle_http_payload(batch)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(OtlpTelemetryExporter.parse_traceparent(resp_tp))
+        assert isinstance(responses, list)
+        # Notification must be omitted -> exactly 3 response items
+        self.assertEqual(len(responses), 3)
+        self.assertEqual(responses[0]["id"], 1)
+        self.assertEqual(responses[0]["result"], {})
+        self.assertEqual(responses[1]["error"]["code"], -32600)
+        self.assertEqual(responses[2]["error"]["code"], -32601)
+
+        # Notification-only batch returns 202 Accepted with None body
+        status_notif, body_notif, _ = disp.handle_http_payload(
+            [{"jsonrpc": "2.0", "method": "notifications/initialized"}]
+        )
+        self.assertEqual(status_notif, 202)
+        self.assertIsNone(body_notif)
+
+        # Empty batch and oversized batch return 400 Invalid Request (-32600)
+        status_empty, body_empty, _ = disp.handle_http_payload([])
+        self.assertEqual(status_empty, 400)
+        assert isinstance(body_empty, dict)
+        self.assertEqual(body_empty["error"]["code"], -32600)
+
+        status_over, body_over, _ = disp.handle_http_payload(
+            [{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(5)]
+        )
+        self.assertEqual(status_over, 400)
+        assert isinstance(body_over, dict)
+        self.assertEqual(body_over["error"]["code"], -32600)
+
+        self.assertGreater(
+            estimate_mcp_tokens([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"query": "x" * 80}}]),
+            estimate_mcp_tokens({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+        )
+
+    def test_http_server_streamable_batch_traceparent_sse_and_429_governance(self) -> None:
+        limiter = SlidingWindowTokenRateLimiter(window_ms=60_000, max_requests_per_window=4, max_tokens_per_window=50)
+        srv = build_server("127.0.0.1", 0, rate_limiter=limiter, max_batch_size=8)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        incoming_tp = "00-abcdef0123456789abcdef0123456789-1122334455667788-01"
+        try:
+            batch_payload = [
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 901,
+                    "method": "tools/call",
+                    "params": {"name": "moe_route_query", "arguments": {"prompt": "Return JSON status ping"}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 902,
+                    "method": "tools/call",
+                    "params": {"name": "rag_hybrid_search", "arguments": {"query": "BM25 RRF", "top_k": 1}},
+                },
+            ]
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps(batch_payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "traceparent": incoming_tp,
+                    "X-Client-Id": "tenant-alpha",
+                },
+            )
+            with opener.open(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                echo_tp = resp.headers.get("traceparent") or ""
+                self.assertTrue(echo_tp.startswith("00-abcdef0123456789abcdef0123456789-"))
+                self.assertEqual(resp.headers.get("X-RateLimit-Limit-Requests"), "4")
+                self.assertEqual(resp.headers.get("X-RateLimit-Remaining-Requests"), "3")
+                arr = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual([item["id"] for item in arr], [901, 902])
+
+            # Verify SSE framing when Accept: text/event-stream is requested
+            sse_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps({"jsonrpc": "2.0", "id": 903, "method": "ping"}).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "X-Client-Id": "tenant-alpha",
+                },
+            )
+            with opener.open(sse_req, timeout=5) as sresp:
+                self.assertIn("text/event-stream", sresp.headers.get("Content-Type", ""))
+                sse_text = sresp.read().decode("utf-8")
+                self.assertIn("event: message\ndata: ", sse_text)
+                self.assertIn('"id": 903', sse_text)
+
+            # Verify OTLP spans share incoming W3C traceId and parentSpanId
+            with opener.open(f"http://127.0.0.1:{port}/metrics/otlp", timeout=5) as oresp:
+                otlp = json.loads(oresp.read().decode("utf-8"))
+                spans = otlp["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                self.assertEqual(len(spans), 2)
+                for sp in spans:
+                    self.assertEqual(sp["traceId"], "abcdef0123456789abcdef0123456789")
+                    self.assertEqual(sp["parentSpanId"], "1122334455667788")
+
+            # Exceed tenant-alpha's 30-token window budget -> HTTP 429 + Retry-After + -32029
+            heavy_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 904,
+                        "method": "tools/call",
+                        "params": {"name": "rag_hybrid_search", "arguments": {"query": "A" * 160, "top_k": 3}},
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "traceparent": incoming_tp,
+                    "X-Client-Id": "tenant-alpha",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                opener.open(heavy_req, timeout=5)
+            err_resp = ctx.exception
+            try:
+                self.assertEqual(err_resp.code, 429)
+                self.assertIsNotNone(err_resp.headers.get("Retry-After"))
+                self.assertTrue((err_resp.headers.get("traceparent") or "").startswith("00-abcdef0123456789abcdef0123456789-"))
+                err_json = json.loads(err_resp.read().decode("utf-8"))
+                self.assertEqual(err_json["error"]["code"], -32029)
+                self.assertEqual(err_json["id"], 904)
+            finally:
+                err_resp.close()
+
+            with opener.open(f"http://127.0.0.1:{port}/health", timeout=5) as hresp:
+                health = json.loads(hresp.read().decode("utf-8"))
+                self.assertEqual(health["version"], "1.3.0")
+                self.assertEqual(health["rate_limit"]["total_allowed"], 2)
+                self.assertEqual(health["rate_limit"]["total_rejected"], 1)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

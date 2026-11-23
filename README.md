@@ -4,7 +4,7 @@
 [![MCP Spec](https://img.shields.io/badge/MCP-2025--11--25-blue.svg)](https://modelcontextprotocol.io/specification/2025-11-25)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)](pyproject.toml)
 
-Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` Tools, Resources & Prompts over JSON-RPC 2.0)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 Highlighted Citation Spans + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, **OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, and **Deterministic Secret/PII Redaction**.
+Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` Streamable HTTP JSON-RPC 2.0 Batching, Tools, Resources & Prompts)**, **W3C `traceparent` Distributed Trace Propagation + OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, **Deterministic Sliding-Window Token-Budget Rate Limiting (`X-RateLimit-*` / `Retry-After`)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 Highlighted Citation Spans + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, and **Deterministic Secret/PII Redaction**.
 
 ---
 
@@ -12,11 +12,12 @@ Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model C
 
 ```mermaid
 flowchart LR
-    Client["SDK / Bento Web UI / Agent Host"] -->|"JSON-RPC 2.0 POST /mcp"| Guard["RedactionGuard (API Key / Bearer / Email Scrub)"]
-    Guard --> Disp["McpJsonRpcDispatcher (2025-11-25 Tools + Resources + Prompts)"]
+    Client["SDK / Bento Web UI / Agent Host"] -->|"POST /mcp (Single or Batch + W3C traceparent)"| Limiter["SlidingWindowTokenRateLimiter (X-RateLimit-* / 429 Retry-After)"]
+    Limiter --> Guard["RedactionGuard (API Key / Bearer / Email Scrub)"]
+    Guard --> Disp["McpJsonRpcDispatcher (2025-11-25 Batch + Tools + Resources + Prompts)"]
     Disp -->|"moe_route_query / moe_sla_routing_plan"| Router["SparseTop2MoeRouter (VRAM + Latency SLA)"]
     Disp -->|"rag_upsert / rag_hybrid_search / resources/read"| Vault["HybridKnowledgeVault (SQLite WAL)"]
-    Disp -->|"otlp_export_telemetry / GET /metrics/otlp"| OTLP["OtlpTelemetryExporter (Spans + Histograms + Cache Counters)"]
+    Disp -->|"otlp_export_telemetry / GET /metrics/otlp"| OTLP["OtlpTelemetryExporter (W3C Spans + Histograms + Rate-Limit Counters)"]
     Vault --> FTS["FTS5 BM25 + Highlighted Citation Spans"]
     Vault --> Vec["L2 Dense N-Gram Vector Cosine"]
     FTS --> RRF["Reciprocal Rank Fusion (k=60)"]
@@ -51,8 +52,8 @@ python -m mcp_moe_sdk.server
 
 ### 3. Containerized Deployment
 ```bash
-docker build -t mcp-moe-hybrid-sdk:1.2.0 .
-docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.2.0
+docker build -t mcp-moe-hybrid-sdk:1.3.0 .
+docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.3.0
 ```
 
 ---
