@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-moe-hybrid-sdk"
-version = "1.0.0"
-description = "Production AI SDK combining Model Context Protocol (MCP 2025-11-25), Sparse Top-2 MoE Cost/Latency Routing, and SQLite WAL FTS5 + Vector RRF Hybrid RAG."
+version = "1.2.0"
+description = "Production AI SDK combining Model Context Protocol (MCP 2025-11-25 tools, resources & prompts), Sparse Top-2 MoE Cost/Latency Routing, SQLite WAL FTS5 Highlighted Hybrid RAG, and OTLP JSON Telemetry."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
