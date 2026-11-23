@@ -6,11 +6,13 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import sqlite3
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class RedactionGuard:
@@ -262,14 +264,195 @@ class SparseTop2MoeRouter:
         return {"calls": len(s), "p50_ms": round(p50, 4), "p95_ms": round(p95, 4)}
 
 
+class OtlpTelemetryExporter:
+    """Zero-dependency OpenTelemetry (OTLP/JSON) span exporter, latency histogram & cache counter."""
+
+    HISTOGRAM_BOUNDS_MS: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 50.0)
+
+    def __init__(
+        self,
+        service_name: str = "mcp-moe-hybrid-sdk",
+        service_version: str = "1.1.0",
+        max_spans: int = 256,
+        span_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.service_name = service_name
+        self.service_version = service_version
+        self.spans: deque[dict[str, Any]] = deque(maxlen=max_spans)
+        self.span_hook = span_hook
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._histograms: dict[str, dict[str, Any]] = {}
+
+    def record_tool_call(
+        self,
+        tool_name: str,
+        start_ns: int,
+        end_ns: int,
+        *,
+        cache_hit: bool = False,
+        is_error: bool = False,
+        attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if tool_name == "rag_hybrid_search":
+            if cache_hit:
+                self.cache_hits += 1
+            else:
+                self.cache_misses += 1
+
+        duration_ms = max(0.0, (end_ns - start_ns) / 1_000_000.0)
+        hist = self._histograms.setdefault(
+            tool_name,
+            {
+                "count": 0,
+                "sum_ms": 0.0,
+                "min_ms": duration_ms,
+                "max_ms": duration_ms,
+                "buckets": [0] * (len(self.HISTOGRAM_BOUNDS_MS) + 1),
+            },
+        )
+        hist["count"] += 1
+        hist["sum_ms"] += duration_ms
+        hist["min_ms"] = min(hist["min_ms"], duration_ms)
+        hist["max_ms"] = max(hist["max_ms"], duration_ms)
+        bucket_idx = len(self.HISTOGRAM_BOUNDS_MS)
+        for idx, bound in enumerate(self.HISTOGRAM_BOUNDS_MS):
+            if duration_ms <= bound:
+                bucket_idx = idx
+                break
+        hist["buckets"][bucket_idx] += 1
+
+        otlp_attrs = [
+            {"key": "mcp.tool.name", "value": {"stringValue": tool_name}},
+            {"key": "mcp.cache.hit", "value": {"boolValue": cache_hit}},
+        ]
+        for k, v in (attributes or {}).items():
+            if isinstance(v, bool):
+                otlp_attrs.append({"key": k, "value": {"boolValue": v}})
+            elif isinstance(v, int):
+                otlp_attrs.append({"key": k, "value": {"intValue": str(v)}})
+            elif isinstance(v, float):
+                otlp_attrs.append({"key": k, "value": {"doubleValue": round(v, 6)}})
+            else:
+                otlp_attrs.append({"key": k, "value": {"stringValue": str(v)}})
+
+        span = {
+            "traceId": secrets.token_hex(16),
+            "spanId": secrets.token_hex(8),
+            "name": f"mcp.tools.call/{tool_name}",
+            "kind": 2,
+            "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(max(start_ns, end_ns)),
+            "attributes": otlp_attrs,
+            "status": {"code": 2 if is_error else 1},
+        }
+        self.spans.append(span)
+        if self.span_hook is not None:
+            self.span_hook(span)
+        return span
+
+    def export_otlp_json(self) -> dict[str, Any]:
+        now_ns = str(time.time_ns())
+        resource = {
+            "attributes": [
+                {"key": "service.name", "value": {"stringValue": self.service_name}},
+                {"key": "service.version", "value": {"stringValue": self.service_version}},
+            ]
+        }
+        dp_hist = []
+        for tool_name, h in sorted(self._histograms.items()):
+            dp_hist.append(
+                {
+                    "attributes": [{"key": "mcp.tool.name", "value": {"stringValue": tool_name}}],
+                    "timeUnixNano": now_ns,
+                    "count": str(h["count"]),
+                    "sum": round(h["sum_ms"], 6),
+                    "min": round(h["min_ms"], 6),
+                    "max": round(h["max_ms"], 6),
+                    "bucketCounts": [str(c) for c in h["buckets"]],
+                    "explicitBounds": list(self.HISTOGRAM_BOUNDS_MS),
+                }
+            )
+        total_lookups = self.cache_hits + self.cache_misses
+        hit_ratio = round(self.cache_hits / total_lookups, 4) if total_lookups else 0.0
+        return {
+            "resourceSpans": [
+                {
+                    "resource": resource,
+                    "scopeSpans": [
+                        {
+                            "scope": {"name": "mcp_moe_sdk.otlp", "version": self.service_version},
+                            "spans": list(self.spans),
+                        }
+                    ],
+                }
+            ],
+            "resourceMetrics": [
+                {
+                    "resource": resource,
+                    "scopeMetrics": [
+                        {
+                            "scope": {"name": "mcp_moe_sdk.otlp", "version": self.service_version},
+                            "metrics": [
+                                {
+                                    "name": "mcp.tool.duration",
+                                    "unit": "ms",
+                                    "histogram": {"aggregationTemporality": 2, "dataPoints": dp_hist},
+                                },
+                                {
+                                    "name": "mcp.rag.cache.requests",
+                                    "unit": "1",
+                                    "sum": {
+                                        "aggregationTemporality": 2,
+                                        "isMonotonic": True,
+                                        "dataPoints": [
+                                            {
+                                                "attributes": [{"key": "result", "value": {"stringValue": "hit"}}],
+                                                "timeUnixNano": now_ns,
+                                                "asInt": str(self.cache_hits),
+                                            },
+                                            {
+                                                "attributes": [{"key": "result", "value": {"stringValue": "miss"}}],
+                                                "timeUnixNano": now_ns,
+                                                "asInt": str(self.cache_misses),
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "summary": {
+                "spans_buffered": len(self.spans),
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "cache_hit_ratio": hit_ratio,
+            },
+        }
+
+
 class McpJsonRpcDispatcher:
-    """Model Context Protocol (MCP 2025-11-25) JSON-RPC 2.0 compliant tool server."""
+    """Model Context Protocol (MCP 2025-11-25) JSON-RPC 2.0 compliant tool server with OTLP telemetry."""
 
     PROTOCOL_VERSION = "2025-11-25"
 
-    def __init__(self, vault: HybridKnowledgeVault | None = None, router: SparseTop2MoeRouter | None = None) -> None:
+    def __init__(
+        self,
+        vault: HybridKnowledgeVault | None = None,
+        router: SparseTop2MoeRouter | None = None,
+        telemetry: OtlpTelemetryExporter | None = None,
+        span_hook: Callable[[dict[str, Any]], None] | None = None,
+        rag_cache_capacity: int = 128,
+    ) -> None:
         self.vault = vault or HybridKnowledgeVault(":memory:")
         self.router = router or SparseTop2MoeRouter()
+        self.telemetry = telemetry or OtlpTelemetryExporter(span_hook=span_hook)
+        if span_hook is not None and self.telemetry.span_hook is None:
+            self.telemetry.span_hook = span_hook
+        self._rag_cache: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
+        self._rag_cache_capacity = max(0, rag_cache_capacity)
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
@@ -285,7 +468,7 @@ class McpJsonRpcDispatcher:
                 "id": req_id,
                 "result": {
                     "protocolVersion": self.PROTOCOL_VERSION,
-                    "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.0.0"},
+                    "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.1.0"},
                     "capabilities": {"tools": {"listChanged": False}},
                 },
             }
@@ -334,18 +517,27 @@ class McpJsonRpcDispatcher:
                                 "required": ["query"],
                             },
                         },
+                        {
+                            "name": "otlp_export_telemetry",
+                            "description": "Export OpenTelemetry (OTLP/JSON) tool-call spans, latency histograms, and RAG cache hit counters.",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        },
                     ]
                 },
             }
         if method == "tools/call":
-            name = params.get("name")
+            name = str(params.get("name", ""))
             args = params.get("arguments") or {}
+            t_start = time.time_ns()
+            cache_hit = False
+            attrs: dict[str, Any] = {}
             if name == "moe_route_query":
                 payload = self.router.route(
                     str(args.get("prompt", "")),
                     float(args.get("max_vram_gib", 6.0)),
                     float(args.get("latency_sla_ms", 1500.0)),
                 )
+                attrs["mcp.selected_tier"] = payload["selected_tier"]
             elif name == "rag_upsert_document":
                 payload = self.vault.upsert(
                     str(args["doc_id"]),
@@ -353,11 +545,31 @@ class McpJsonRpcDispatcher:
                     str(args["body"]),
                     list(args.get("tags") or []),
                 )
+                self._rag_cache.clear()
+                attrs["mcp.redactions"] = payload["redactions_applied"]
             elif name == "rag_hybrid_search":
-                hits = self.vault.hybrid_search(str(args.get("query", "")), int(args.get("top_k", 5)))
-                payload = {"hits": [h.__dict__ for h in hits], "vault_documents": self.vault.count()}
+                clean_q, _ = RedactionGuard.sanitize(str(args.get("query", "")))
+                top_k = int(args.get("top_k", 5))
+                ckey = (" ".join(clean_q.lower().split()), top_k)
+                if self._rag_cache_capacity > 0 and ckey in self._rag_cache:
+                    self._rag_cache.move_to_end(ckey)
+                    payload = {**self._rag_cache[ckey], "cache_hit": True}
+                    cache_hit = True
+                else:
+                    hits = self.vault.hybrid_search(clean_q, top_k)
+                    base_payload = {"hits": [h.__dict__ for h in hits], "vault_documents": self.vault.count()}
+                    if self._rag_cache_capacity > 0:
+                        self._rag_cache[ckey] = base_payload
+                        if len(self._rag_cache) > self._rag_cache_capacity:
+                            self._rag_cache.popitem(last=False)
+                    payload = {**base_payload, "cache_hit": False}
+                attrs["mcp.hits"] = len(payload["hits"])
+            elif name == "otlp_export_telemetry":
+                payload = self.telemetry.export_otlp_json()
             else:
+                self.telemetry.record_tool_call(name or "unknown", t_start, time.time_ns(), is_error=True)
                 return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+            self.telemetry.record_tool_call(name, t_start, time.time_ns(), cache_hit=cache_hit, attributes=attrs)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,

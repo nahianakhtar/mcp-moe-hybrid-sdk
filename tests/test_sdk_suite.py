@@ -7,7 +7,13 @@ import threading
 import urllib.request
 import unittest
 
-from mcp_moe_sdk.engine import HybridKnowledgeVault, McpJsonRpcDispatcher, RedactionGuard, SparseTop2MoeRouter
+from mcp_moe_sdk.engine import (
+    HybridKnowledgeVault,
+    McpJsonRpcDispatcher,
+    OtlpTelemetryExporter,
+    RedactionGuard,
+    SparseTop2MoeRouter,
+)
 from mcp_moe_sdk.server import build_server
 
 
@@ -74,9 +80,70 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
                 self.assertEqual(body["id"], 42)
                 inner = json.loads(body["result"]["content"][0]["text"])
                 self.assertEqual(inner["hits"][0]["doc_id"], "arch-sqlite-rrf")
+                self.assertFalse(inner["cache_hit"])
+
+            with opener.open(req, timeout=5) as mresp2:
+                inner2 = json.loads(json.loads(mresp2.read().decode("utf-8"))["result"]["content"][0]["text"])
+                self.assertTrue(inner2["cache_hit"])
+
+            with opener.open(f"http://127.0.0.1:{port}/metrics/otlp", timeout=5) as oresp:
+                otlp = json.loads(oresp.read().decode("utf-8"))
+                self.assertEqual(otlp["summary"]["cache_hits"], 1)
+                self.assertEqual(otlp["summary"]["cache_misses"], 1)
+                self.assertGreaterEqual(len(otlp["resourceSpans"][0]["scopeSpans"][0]["spans"]), 2)
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_otlp_span_hook_histogram_and_cache_invalidation(self) -> None:
+        captured_spans: list[dict] = []
+        exporter = OtlpTelemetryExporter(span_hook=captured_spans.append)
+        disp = McpJsonRpcDispatcher(telemetry=exporter)
+
+        disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "rag_upsert_document",
+                    "arguments": {"doc_id": "otlp-1", "title": "OTLP Histogram Spec", "body": "Exports tool latency buckets.", "tags": ["otlp"]},
+                },
+            }
+        )
+        r1 = disp.handle(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "rag_hybrid_search", "arguments": {"query": "OTLP Histogram", "top_k": 1}}}
+        )
+        r2 = disp.handle(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "rag_hybrid_search", "arguments": {"query": "  otlp   histogram ", "top_k": 1}}}
+        )
+        self.assertFalse(json.loads(r1["result"]["content"][0]["text"])["cache_hit"])
+        self.assertTrue(json.loads(r2["result"]["content"][0]["text"])["cache_hit"])
+
+        # Upsert must invalidate cached RAG search entries cleanly
+        disp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "rag_upsert_document",
+                    "arguments": {"doc_id": "otlp-2", "title": "OTLP Cache Reset", "body": "Invalidates stale RAG cache.", "tags": ["otlp"]},
+                },
+            }
+        )
+        r3 = disp.handle(
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "rag_hybrid_search", "arguments": {"query": "OTLP Histogram", "top_k": 2}}}
+        )
+        self.assertFalse(json.loads(r3["result"]["content"][0]["text"])["cache_hit"])
+        self.assertEqual(len(captured_spans), 5)
+
+        otlp = exporter.export_otlp_json()
+        self.assertEqual(otlp["summary"]["cache_hits"], 1)
+        self.assertEqual(otlp["summary"]["cache_misses"], 2)
+        metrics = otlp["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        self.assertEqual(metrics[0]["name"], "mcp.tool.duration")
+        self.assertGreaterEqual(len(metrics[0]["histogram"]["dataPoints"]), 2)
 
 
 if __name__ == "__main__":

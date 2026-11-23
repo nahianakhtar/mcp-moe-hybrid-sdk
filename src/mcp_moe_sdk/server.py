@@ -30,8 +30,8 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="card full">
-    <h1>mcp-moe-hybrid-sdk v1.0.0</h1>
-    <div style="color:var(--muted)">MCP 2025-11-25 JSON-RPC 2.0 &bull; Sparse Top-2 MoE SLA Router &bull; SQLite WAL FTS5 + Vector RRF Hybrid RAG</div>
+    <h1>mcp-moe-hybrid-sdk v1.1.0</h1>
+    <div style="color:var(--muted)">MCP 2025-11-25 JSON-RPC 2.0 &bull; Sparse Top-2 MoE SLA Router &bull; SQLite WAL FTS5 + Vector RRF &bull; OTLP JSON Telemetry</div>
   </div>
   <div class="card">
     <h2>1. Sparse Top-2 MoE Router</h2>
@@ -107,8 +107,12 @@ def build_server(host: str = "127.0.0.1", port: int = 8090) -> ThreadingHTTPServ
                         "protocol": dispatcher.PROTOCOL_VERSION,
                         "documents": dispatcher.vault.count(),
                         "router": dispatcher.router.stats(),
+                        "telemetry": dispatcher.telemetry.export_otlp_json()["summary"],
                     },
                 )
+                return
+            if self.path == "/metrics/otlp":
+                self._send_json(200, dispatcher.telemetry.export_otlp_json())
                 return
             html = DASHBOARD_HTML.encode("utf-8")
             self.send_response(200)

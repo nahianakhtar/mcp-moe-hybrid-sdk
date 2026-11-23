@@ -4,7 +4,7 @@
 [![MCP Spec](https://img.shields.io/badge/MCP-2025--11--25-blue.svg)](https://modelcontextprotocol.io/specification/2025-11-25)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)](pyproject.toml)
 
-Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` JSON-RPC 2.0)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, and **Deterministic Secret/PII Redaction**.
+Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` JSON-RPC 2.0)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, **OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, and **Deterministic Secret/PII Redaction**.
 
 ---
 
@@ -16,6 +16,7 @@ flowchart LR
     Guard --> Disp["McpJsonRpcDispatcher (2025-11-25)"]
     Disp -->|"moe_route_query"| Router["SparseTop2MoeRouter (VRAM + Latency SLA)"]
     Disp -->|"rag_upsert / rag_hybrid_search"| Vault["HybridKnowledgeVault (SQLite WAL)"]
+    Disp -->|"otlp_export_telemetry / GET /metrics/otlp"| OTLP["OtlpTelemetryExporter (Spans + Histograms + Cache Counters)"]
     Vault --> FTS["FTS5 BM25 Lexical Index"]
     Vault --> Vec["L2 Dense N-Gram Vector Cosine"]
     FTS --> RRF["Reciprocal Rank Fusion (k=60)"]
