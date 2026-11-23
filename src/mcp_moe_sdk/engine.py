@@ -3,14 +3,49 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import math
 import re
+import secrets
 import sqlite3
 import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+_FTS_OPEN = "\x01"
+_FTS_CLOSE = "\x02"
+
+
+def _extract_fts5_citation_spans(marked_text: str, field: str) -> list[dict[str, Any]]:
+    """Extract exact 0-based [start, end) character offsets from SQLite FTS5 highlight() output."""
+    spans: list[dict[str, Any]] = []
+    cursor = 0
+    plain_pos = 0
+    n = len(marked_text)
+    while cursor < n:
+        open_idx = marked_text.find(_FTS_OPEN, cursor)
+        if open_idx == -1:
+            break
+        plain_pos += open_idx - cursor
+        close_idx = marked_text.find(_FTS_CLOSE, open_idx + 1)
+        if close_idx == -1:
+            break
+        term = marked_text[open_idx + 1 : close_idx]
+        start = plain_pos
+        end = start + len(term)
+        spans.append({"field": field, "term": term, "start": start, "end": end})
+        plain_pos = end
+        cursor = close_idx + 1
+    return spans
+
+
+def _render_safe_highlighted_snippet(marked_snippet: str) -> str:
+    """HTML-escape untrusted document text while converting FTS5 sentinels into <mark> tags."""
+    escaped = html.escape(marked_snippet, quote=False)
+    return escaped.replace(_FTS_OPEN, "<mark>").replace(_FTS_CLOSE, "</mark>")
 
 
 class RedactionGuard:
@@ -62,6 +97,21 @@ class SearchHit:
     lexical_rank: int | None
     vector_rank: int | None
     cosine: float
+    highlighted_snippet: str = ""
+    citation_spans: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "doc_id": self.doc_id,
+            "title": self.title,
+            "snippet": self.snippet,
+            "highlighted_snippet": self.highlighted_snippet,
+            "citation_spans": list(self.citation_spans),
+            "rrf_score": self.rrf_score,
+            "lexical_rank": self.lexical_rank,
+            "vector_rank": self.vector_rank,
+            "cosine": self.cosine,
+        }
 
 
 class HybridKnowledgeVault:
@@ -98,8 +148,8 @@ class HybridKnowledgeVault:
         self.conn.commit()
 
     def upsert(self, doc_id: str, title: str, body: str, tags: list[str] | None = None) -> dict[str, Any]:
-        clean_title, r1 = RedactionGuard.sanitize(title)
-        clean_body, r2 = RedactionGuard.sanitize(body)
+        clean_title, r1 = RedactionGuard.sanitize(title.replace(_FTS_OPEN, "").replace(_FTS_CLOSE, ""))
+        clean_body, r2 = RedactionGuard.sanitize(body.replace(_FTS_OPEN, "").replace(_FTS_CLOSE, ""))
         tag_str = " ".join(tags or [])
         emb = deterministic_embed(f"{clean_title} {clean_body} {tag_str}")
         now = time.time()
@@ -129,14 +179,26 @@ class HybridKnowledgeVault:
         clean_q, _ = RedactionGuard.sanitize(query)
         q_tokens = re.findall(r"[A-Za-z0-9_]+", clean_q)
         lex_ranks: dict[str, int] = {}
+        fts_highlights: dict[str, tuple[str, str, str]] = {}
         if q_tokens:
             fts_expr = " OR ".join(f'"{t}"' for t in q_tokens[:12])
             rows = self.conn.execute(
-                "SELECT doc_id FROM documents_fts WHERE documents_fts MATCH ? ORDER BY bm25(documents_fts) LIMIT 50",
+                """
+                SELECT
+                    doc_id,
+                    snippet(documents_fts, 2, char(1), char(2), '...', 24),
+                    highlight(documents_fts, 1, char(1), char(2)),
+                    highlight(documents_fts, 2, char(1), char(2))
+                FROM documents_fts
+                WHERE documents_fts MATCH ?
+                ORDER BY bm25(documents_fts)
+                LIMIT 50
+                """,
                 (fts_expr,),
             ).fetchall()
-            for rank_idx, (did,) in enumerate(rows, start=1):
+            for rank_idx, (did, raw_snip, hl_title, hl_body) in enumerate(rows, start=1):
                 lex_ranks[did] = rank_idx
+                fts_highlights[did] = (raw_snip or "", hl_title or "", hl_body or "")
 
         q_vec = deterministic_embed(clean_q)
         all_docs = self.conn.execute("SELECT doc_id, title, body, embedding_json FROM documents").fetchall()
@@ -147,25 +209,70 @@ class HybridKnowledgeVault:
         scored_vec.sort(key=lambda item: item[3], reverse=True)
         vec_ranks = {item[0]: idx for idx, item in enumerate(scored_vec, start=1)}
 
-        fused: list[SearchHit] = []
+        candidates: list[tuple[float, float, str, str, str, int | None, int]] = []
         for did, title, body, sim in scored_vec:
             l_rank = lex_ranks.get(did)
             v_rank = vec_ranks[did]
             score = (1.0 / (rrf_k + v_rank)) + ((1.25 / (rrf_k + l_rank)) if l_rank is not None else 0.0)
+            candidates.append((round(score, 6), round(sim, 4), did, title, body, l_rank, v_rank))
+
+        candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+        fused: list[SearchHit] = []
+        for score, sim_rounded, did, title, body, l_rank, v_rank in candidates[: max(1, top_k)]:
             snippet = body[:180] + ("..." if len(body) > 180 else "")
+            if did in fts_highlights:
+                raw_snip, hl_title, hl_body = fts_highlights[did]
+                hl_snippet = _render_safe_highlighted_snippet(raw_snip) if raw_snip else html.escape(snippet, quote=False)
+                spans = _extract_fts5_citation_spans(hl_title, "title") + _extract_fts5_citation_spans(hl_body, "body")
+            else:
+                hl_snippet = html.escape(snippet, quote=False)
+                spans = []
             fused.append(
                 SearchHit(
                     doc_id=did,
                     title=title,
                     snippet=snippet,
-                    rrf_score=round(score, 6),
+                    rrf_score=score,
                     lexical_rank=l_rank,
                     vector_rank=v_rank,
-                    cosine=round(sim, 4),
+                    cosine=sim_rounded,
+                    highlighted_snippet=hl_snippet,
+                    citation_spans=tuple(spans),
                 )
             )
-        fused.sort(key=lambda h: (h.rrf_score, h.cosine), reverse=True)
-        return fused[: max(1, top_k)]
+        return fused
+
+    def get_document(self, doc_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT doc_id, title, body, tags, redactions, updated_unix FROM documents WHERE doc_id = ?",
+            (doc_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        did, title, body, tags_str, redactions, updated_unix = row
+        return {
+            "doc_id": did,
+            "title": title,
+            "body": body,
+            "tags": [t for t in tags_str.split(" ") if t],
+            "redactions": int(redactions),
+            "updated_unix": float(updated_unix),
+        }
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT doc_id, title, tags, redactions, updated_unix FROM documents ORDER BY doc_id ASC"
+        ).fetchall()
+        return [
+            {
+                "doc_id": did,
+                "title": title,
+                "tags": [t for t in tags_str.split(" ") if t],
+                "redactions": int(redactions),
+                "updated_unix": float(updated_unix),
+            }
+            for did, title, tags_str, redactions, updated_unix in rows
+        ]
 
     def count(self) -> int:
         return int(self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
@@ -262,14 +369,282 @@ class SparseTop2MoeRouter:
         return {"calls": len(s), "p50_ms": round(p50, 4), "p95_ms": round(p95, 4)}
 
 
+class OtlpTelemetryExporter:
+    """Zero-dependency OpenTelemetry (OTLP/JSON) span exporter, latency histogram & cache counter."""
+
+    HISTOGRAM_BOUNDS_MS: tuple[float, ...] = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 50.0)
+
+    def __init__(
+        self,
+        service_name: str = "mcp-moe-hybrid-sdk",
+        service_version: str = "1.2.0",
+        max_spans: int = 256,
+        span_hook: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.service_name = service_name
+        self.service_version = service_version
+        self.spans: deque[dict[str, Any]] = deque(maxlen=max_spans)
+        self.span_hook = span_hook
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self._histograms: dict[str, dict[str, Any]] = {}
+
+    def record_tool_call(
+        self,
+        tool_name: str,
+        start_ns: int,
+        end_ns: int,
+        *,
+        cache_hit: bool = False,
+        is_error: bool = False,
+        attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if tool_name == "rag_hybrid_search":
+            if cache_hit:
+                self.cache_hits += 1
+            else:
+                self.cache_misses += 1
+
+        duration_ms = max(0.0, (end_ns - start_ns) / 1_000_000.0)
+        hist = self._histograms.setdefault(
+            tool_name,
+            {
+                "count": 0,
+                "sum_ms": 0.0,
+                "min_ms": duration_ms,
+                "max_ms": duration_ms,
+                "buckets": [0] * (len(self.HISTOGRAM_BOUNDS_MS) + 1),
+            },
+        )
+        hist["count"] += 1
+        hist["sum_ms"] += duration_ms
+        hist["min_ms"] = min(hist["min_ms"], duration_ms)
+        hist["max_ms"] = max(hist["max_ms"], duration_ms)
+        bucket_idx = len(self.HISTOGRAM_BOUNDS_MS)
+        for idx, bound in enumerate(self.HISTOGRAM_BOUNDS_MS):
+            if duration_ms <= bound:
+                bucket_idx = idx
+                break
+        hist["buckets"][bucket_idx] += 1
+
+        otlp_attrs = [
+            {"key": "mcp.tool.name", "value": {"stringValue": tool_name}},
+            {"key": "mcp.cache.hit", "value": {"boolValue": cache_hit}},
+        ]
+        for k, v in (attributes or {}).items():
+            if isinstance(v, bool):
+                otlp_attrs.append({"key": k, "value": {"boolValue": v}})
+            elif isinstance(v, int):
+                otlp_attrs.append({"key": k, "value": {"intValue": str(v)}})
+            elif isinstance(v, float):
+                otlp_attrs.append({"key": k, "value": {"doubleValue": round(v, 6)}})
+            else:
+                otlp_attrs.append({"key": k, "value": {"stringValue": str(v)}})
+
+        span = {
+            "traceId": secrets.token_hex(16),
+            "spanId": secrets.token_hex(8),
+            "name": f"mcp.tools.call/{tool_name}",
+            "kind": 2,
+            "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(max(start_ns, end_ns)),
+            "attributes": otlp_attrs,
+            "status": {"code": 2 if is_error else 1},
+        }
+        self.spans.append(span)
+        if self.span_hook is not None:
+            self.span_hook(span)
+        return span
+
+    def export_otlp_json(self) -> dict[str, Any]:
+        now_ns = str(time.time_ns())
+        resource = {
+            "attributes": [
+                {"key": "service.name", "value": {"stringValue": self.service_name}},
+                {"key": "service.version", "value": {"stringValue": self.service_version}},
+            ]
+        }
+        dp_hist = []
+        for tool_name, h in sorted(self._histograms.items()):
+            dp_hist.append(
+                {
+                    "attributes": [{"key": "mcp.tool.name", "value": {"stringValue": tool_name}}],
+                    "timeUnixNano": now_ns,
+                    "count": str(h["count"]),
+                    "sum": round(h["sum_ms"], 6),
+                    "min": round(h["min_ms"], 6),
+                    "max": round(h["max_ms"], 6),
+                    "bucketCounts": [str(c) for c in h["buckets"]],
+                    "explicitBounds": list(self.HISTOGRAM_BOUNDS_MS),
+                }
+            )
+        total_lookups = self.cache_hits + self.cache_misses
+        hit_ratio = round(self.cache_hits / total_lookups, 4) if total_lookups else 0.0
+        return {
+            "resourceSpans": [
+                {
+                    "resource": resource,
+                    "scopeSpans": [
+                        {
+                            "scope": {"name": "mcp_moe_sdk.otlp", "version": self.service_version},
+                            "spans": list(self.spans),
+                        }
+                    ],
+                }
+            ],
+            "resourceMetrics": [
+                {
+                    "resource": resource,
+                    "scopeMetrics": [
+                        {
+                            "scope": {"name": "mcp_moe_sdk.otlp", "version": self.service_version},
+                            "metrics": [
+                                {
+                                    "name": "mcp.tool.duration",
+                                    "unit": "ms",
+                                    "histogram": {"aggregationTemporality": 2, "dataPoints": dp_hist},
+                                },
+                                {
+                                    "name": "mcp.rag.cache.requests",
+                                    "unit": "1",
+                                    "sum": {
+                                        "aggregationTemporality": 2,
+                                        "isMonotonic": True,
+                                        "dataPoints": [
+                                            {
+                                                "attributes": [{"key": "result", "value": {"stringValue": "hit"}}],
+                                                "timeUnixNano": now_ns,
+                                                "asInt": str(self.cache_hits),
+                                            },
+                                            {
+                                                "attributes": [{"key": "result", "value": {"stringValue": "miss"}}],
+                                                "timeUnixNano": now_ns,
+                                                "asInt": str(self.cache_misses),
+                                            },
+                                        ],
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "summary": {
+                "spans_buffered": len(self.spans),
+                "cache_hits": self.cache_hits,
+                "cache_misses": self.cache_misses,
+                "cache_hit_ratio": hit_ratio,
+            },
+        }
+
+
 class McpJsonRpcDispatcher:
-    """Model Context Protocol (MCP 2025-11-25) JSON-RPC 2.0 compliant tool server."""
+    """Model Context Protocol (MCP 2025-11-25) JSON-RPC 2.0 server with tools, resources, prompts & OTLP telemetry."""
 
     PROTOCOL_VERSION = "2025-11-25"
+    SUPPORTED_PROTOCOL_VERSIONS: tuple[str, ...] = (
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05",
+    )
 
-    def __init__(self, vault: HybridKnowledgeVault | None = None, router: SparseTop2MoeRouter | None = None) -> None:
+    def __init__(
+        self,
+        vault: HybridKnowledgeVault | None = None,
+        router: SparseTop2MoeRouter | None = None,
+        telemetry: OtlpTelemetryExporter | None = None,
+        span_hook: Callable[[dict[str, Any]], None] | None = None,
+        rag_cache_capacity: int = 128,
+    ) -> None:
         self.vault = vault or HybridKnowledgeVault(":memory:")
         self.router = router or SparseTop2MoeRouter()
+        self.telemetry = telemetry or OtlpTelemetryExporter(span_hook=span_hook)
+        if span_hook is not None and self.telemetry.span_hook is None:
+            self.telemetry.span_hook = span_hook
+        self._rag_cache: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
+        self._rag_cache_capacity = max(0, rag_cache_capacity)
+        self.negotiated_client_capabilities: dict[str, Any] = {}
+        self._custom_resources: OrderedDict[str, tuple[dict[str, Any], Callable[[], str | dict[str, Any]]]] = OrderedDict()
+        self._custom_prompts: OrderedDict[str, tuple[dict[str, Any], Callable[[dict[str, Any]], dict[str, Any]]]] = OrderedDict()
+
+    def register_resource(
+        self,
+        uri: str,
+        name: str,
+        description: str,
+        reader: Callable[[], str | dict[str, Any]],
+        mime_type: str = "application/json",
+    ) -> None:
+        self._custom_resources[uri] = (
+            {"uri": uri, "name": name, "description": description, "mimeType": mime_type},
+            reader,
+        )
+
+    def register_prompt(
+        self,
+        name: str,
+        description: str,
+        arguments: list[dict[str, Any]],
+        renderer: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        self._custom_prompts[name] = (
+            {"name": name, "description": description, "arguments": arguments},
+            renderer,
+        )
+
+    def _list_resources(self) -> list[dict[str, Any]]:
+        resources: list[dict[str, Any]] = [
+            {
+                "uri": "mcp://moe-router/tiers",
+                "name": "Sparse Top-2 MoE Tier Table & SLA Telemetry",
+                "description": "Hardware VRAM budgets, per-token cost estimates, and p50/p95 router latency statistics.",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "mcp://telemetry/otlp",
+                "name": "OpenTelemetry (OTLP/JSON) Spans & Histograms",
+                "description": "Live OTLP resourceSpans, latency histograms, and RAG LRU cache hit counters.",
+                "mimeType": "application/json",
+            },
+        ]
+        for meta, _ in self._custom_resources.values():
+            resources.append(dict(meta))
+        for doc in self.vault.list_documents():
+            tag_label = ", ".join(doc["tags"]) if doc["tags"] else "untagged"
+            resources.append(
+                {
+                    "uri": f"vault://documents/{doc['doc_id']}",
+                    "name": doc["title"],
+                    "description": f"Hybrid RAG indexed document [{tag_label}] (redactions={doc['redactions']}).",
+                    "mimeType": "application/json",
+                }
+            )
+        return resources
+
+    def _list_prompts(self) -> list[dict[str, Any]]:
+        prompts: list[dict[str, Any]] = [
+            {
+                "name": "grounded_rag_answer",
+                "description": "Synthesize a citation-grounded response using SQLite FTS5 highlighted spans and RRF retrieval.",
+                "arguments": [
+                    {"name": "query", "description": "Question or topic to ground against the vault.", "required": True},
+                    {"name": "top_k", "description": "Maximum passages to cite (default: 3).", "required": False},
+                ],
+            },
+            {
+                "name": "moe_sla_routing_plan",
+                "description": "Generate a VRAM- and SLA-constrained Sparse Top-2 Mixture-of-Experts execution plan.",
+                "arguments": [
+                    {"name": "task", "description": "Prompt or workload to classify across MoE tiers.", "required": True},
+                    {"name": "max_vram_gib", "description": "Maximum VRAM budget in GiB (default: 6.0).", "required": False},
+                    {"name": "latency_sla_ms", "description": "Latency SLA target in milliseconds (default: 1500.0).", "required": False},
+                ],
+            },
+        ]
+        for meta, _ in self._custom_prompts.values():
+            prompts.append(dict(meta))
+        return prompts
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
@@ -280,15 +655,151 @@ class McpJsonRpcDispatcher:
         params = req.get("params") or {}
 
         if method == "initialize":
+            requested_version = str(params.get("protocolVersion") or self.PROTOCOL_VERSION)
+            negotiated_version = (
+                requested_version if requested_version in self.SUPPORTED_PROTOCOL_VERSIONS else self.PROTOCOL_VERSION
+            )
+            client_caps = params.get("capabilities")
+            if isinstance(client_caps, dict):
+                self.negotiated_client_capabilities = dict(client_caps)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "protocolVersion": self.PROTOCOL_VERSION,
-                    "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.0.0"},
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "protocolVersion": negotiated_version,
+                    "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.2.0"},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                        "prompts": {"listChanged": False},
+                    },
                 },
             }
+        if method in ("notifications/initialized", "ping"):
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+        if method == "resources/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": self._list_resources()}}
+        if method == "resources/templates/list":
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "resourceTemplates": [
+                        {
+                            "uriTemplate": "vault://documents/{doc_id}",
+                            "name": "Hybrid Knowledge Vault Document",
+                            "description": "Retrieve a sanitized document, tags, and redaction metadata by doc_id.",
+                            "mimeType": "application/json",
+                        }
+                    ]
+                },
+            }
+        if method == "resources/read":
+            uri = str(params.get("uri") or "").strip()
+            if not uri:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Invalid params: 'uri' is required"}}
+            if uri == "mcp://moe-router/tiers":
+                text = json.dumps({"tiers": self.router.TIERS, "stats": self.router.stats()})
+                mime = "application/json"
+            elif uri == "mcp://telemetry/otlp":
+                text = json.dumps(self.telemetry.export_otlp_json())
+                mime = "application/json"
+            elif uri in self._custom_resources:
+                meta, reader = self._custom_resources[uri]
+                raw_val = reader()
+                text = raw_val if isinstance(raw_val, str) else json.dumps(raw_val)
+                mime = meta["mimeType"]
+            elif uri.startswith("vault://documents/"):
+                doc_id = uri[len("vault://documents/") :]
+                doc = self.vault.get_document(doc_id)
+                if doc is None:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32002, "message": f"Resource not found: {uri}", "data": {"uri": uri}},
+                    }
+                text = json.dumps(doc)
+                mime = "application/json"
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32002, "message": f"Resource not found: {uri}", "data": {"uri": uri}},
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"contents": [{"uri": uri, "mimeType": mime, "text": text}]},
+            }
+        if method == "prompts/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": self._list_prompts()}}
+        if method == "prompts/get":
+            pname = str(params.get("name") or "").strip()
+            pargs = params.get("arguments") or {}
+            if pname == "grounded_rag_answer":
+                raw_query = str(pargs.get("query") or "").strip()
+                if not raw_query:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": "Invalid params: missing required argument 'query'"},
+                    }
+                clean_q, _ = RedactionGuard.sanitize(raw_query)
+                top_k = max(1, int(pargs.get("top_k") or 3))
+                hits = self.vault.hybrid_search(clean_q, top_k=top_k)
+                evidence_lines = [
+                    f"[{h.doc_id}] {h.title} (rrf={h.rrf_score}, spans={len(h.citation_spans)}): {h.highlighted_snippet}"
+                    for h in hits
+                ]
+                context_block = "\n".join(evidence_lines) if evidence_lines else "No indexed passages matched."
+                prompt_text = (
+                    f"Answer the query strictly from the cited evidence passages and cite [doc_id] inline.\n"
+                    f"Query: {clean_q}\n"
+                    f"Evidence:\n{context_block}"
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "description": f"Citation-grounded synthesis prompt ({len(hits)} FTS5+RRF passages)",
+                        "messages": [{"role": "user", "content": {"type": "text", "text": prompt_text}}],
+                    },
+                }
+            if pname == "moe_sla_routing_plan":
+                raw_task = str(pargs.get("task") or "").strip()
+                if not raw_task:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32602, "message": "Invalid params: missing required argument 'task'"},
+                    }
+                vram = float(pargs.get("max_vram_gib") or 6.0)
+                sla = float(pargs.get("latency_sla_ms") or 1500.0)
+                decision = self.router.route(raw_task, max_vram_gib=vram, latency_sla_ms=sla)
+                plan_text = (
+                    f"Execute workload via tier '{decision['selected_tier']}' ({decision['selected_expert']}) "
+                    f"under {vram:.1f} GiB VRAM / {sla:.0f} ms SLA.\n"
+                    f"Top-2 Sparse Gates: {json.dumps(decision['top2_sparse_gates'])}"
+                )
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "description": f"Sparse Top-2 MoE execution plan -> {decision['selected_tier']}",
+                        "messages": [{"role": "user", "content": {"type": "text", "text": plan_text}}],
+                    },
+                }
+            if pname in self._custom_prompts:
+                meta, renderer = self._custom_prompts[pname]
+                for arg_def in meta.get("arguments", []):
+                    if arg_def.get("required") and not str(pargs.get(arg_def["name"]) or "").strip():
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {"code": -32602, "message": f"Invalid params: missing required argument '{arg_def['name']}'"},
+                        }
+                return {"jsonrpc": "2.0", "id": req_id, "result": renderer(pargs)}
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown prompt: {pname}"}}
         if method == "tools/list":
             return {
                 "jsonrpc": "2.0",
@@ -324,7 +835,7 @@ class McpJsonRpcDispatcher:
                         },
                         {
                             "name": "rag_hybrid_search",
-                            "description": "Execute hybrid BM25 FTS5 + cosine vector search fused with Reciprocal Rank Fusion (RRF).",
+                            "description": "Execute hybrid BM25 FTS5 + cosine vector search fused with Reciprocal Rank Fusion (RRF) and highlighted citation spans.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -334,18 +845,27 @@ class McpJsonRpcDispatcher:
                                 "required": ["query"],
                             },
                         },
+                        {
+                            "name": "otlp_export_telemetry",
+                            "description": "Export OpenTelemetry (OTLP/JSON) tool-call spans, latency histograms, and RAG cache hit counters.",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        },
                     ]
                 },
             }
         if method == "tools/call":
-            name = params.get("name")
+            name = str(params.get("name", ""))
             args = params.get("arguments") or {}
+            t_start = time.time_ns()
+            cache_hit = False
+            attrs: dict[str, Any] = {}
             if name == "moe_route_query":
                 payload = self.router.route(
                     str(args.get("prompt", "")),
                     float(args.get("max_vram_gib", 6.0)),
                     float(args.get("latency_sla_ms", 1500.0)),
                 )
+                attrs["mcp.selected_tier"] = payload["selected_tier"]
             elif name == "rag_upsert_document":
                 payload = self.vault.upsert(
                     str(args["doc_id"]),
@@ -353,11 +873,31 @@ class McpJsonRpcDispatcher:
                     str(args["body"]),
                     list(args.get("tags") or []),
                 )
+                self._rag_cache.clear()
+                attrs["mcp.redactions"] = payload["redactions_applied"]
             elif name == "rag_hybrid_search":
-                hits = self.vault.hybrid_search(str(args.get("query", "")), int(args.get("top_k", 5)))
-                payload = {"hits": [h.__dict__ for h in hits], "vault_documents": self.vault.count()}
+                clean_q, _ = RedactionGuard.sanitize(str(args.get("query", "")))
+                top_k = int(args.get("top_k", 5))
+                ckey = (" ".join(clean_q.lower().split()), top_k)
+                if self._rag_cache_capacity > 0 and ckey in self._rag_cache:
+                    self._rag_cache.move_to_end(ckey)
+                    payload = {**self._rag_cache[ckey], "cache_hit": True}
+                    cache_hit = True
+                else:
+                    hits = self.vault.hybrid_search(clean_q, top_k)
+                    base_payload = {"hits": [h.to_dict() for h in hits], "vault_documents": self.vault.count()}
+                    if self._rag_cache_capacity > 0:
+                        self._rag_cache[ckey] = base_payload
+                        if len(self._rag_cache) > self._rag_cache_capacity:
+                            self._rag_cache.popitem(last=False)
+                    payload = {**base_payload, "cache_hit": False}
+                attrs["mcp.hits"] = len(payload["hits"])
+            elif name == "otlp_export_telemetry":
+                payload = self.telemetry.export_otlp_json()
             else:
+                self.telemetry.record_tool_call(name or "unknown", t_start, time.time_ns(), is_error=True)
                 return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {name}"}}
+            self.telemetry.record_tool_call(name, t_start, time.time_ns(), cache_hit=cache_hit, attributes=attrs)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
