@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-moe-hybrid-sdk"
+version = "1.0.0"
+description = "Production AI SDK combining Model Context Protocol (MCP 2025-11-25), Sparse Top-2 MoE Cost/Latency Routing, and SQLite WAL FTS5 + Vector RRF Hybrid RAG."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Nahian Akhtar" }]
+keywords = ["mcp", "mixture-of-experts", "hybrid-rag", "sqlite-fts5", "ai-sdk", "llm-routing"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
