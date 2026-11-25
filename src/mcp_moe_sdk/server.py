@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .engine import (
     HybridKnowledgeVault,
     McpJsonRpcDispatcher,
+    OAuthProtectedResourceGuard,
     SlidingWindowTokenRateLimiter,
     SparseTop2MoeRouter,
     estimate_mcp_tokens,
@@ -37,8 +39,8 @@ DASHBOARD_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <div class="card full">
-    <h1>mcp-moe-hybrid-sdk v1.8.0</h1>
-    <div style="color:var(--muted)">MCP 2025-11-25 Streamable HTTP Batching &bull; Mcp-Session-Id &amp; Last-Event-ID SSE Replay &bull; ResourceLink &amp; Annotations Provenance &bull; Elicitation Flat-Schema &amp; Sampling HITL Governance &bull; Monotonic notifications/progress &bull; roots/list RFC 8089 URI Confinement &bull; CRC32C Cursor Pagination &bull; completion/complete &bull; Subscriptions &amp; RFC 5424 Logging &bull; JSON-Schema 2020-12 outputSchema &bull; notifications/cancelled &bull; W3C traceparent OTLP &bull; Sparse Top-2 MoE &bull; SQLite WAL FTS5 RRF</div>
+    <h1>mcp-moe-hybrid-sdk v1.9.0</h1>
+    <div style="color:var(--muted)">MCP 2025-11-25 Streamable HTTP Batching &bull; OAuth 2.1 RFC 9728 Protected Resource Metadata, PKCE S256 &amp; RFC 8707 Audience Introspection &bull; Mcp-Session-Id &amp; Last-Event-ID SSE Replay &bull; ResourceLink &amp; Annotations Provenance &bull; Elicitation Flat-Schema &amp; Sampling HITL Governance &bull; Monotonic notifications/progress &bull; roots/list RFC 8089 URI Confinement &bull; CRC32C Cursor Pagination &bull; completion/complete &bull; Subscriptions &amp; RFC 5424 Logging &bull; JSON-Schema 2020-12 outputSchema &bull; notifications/cancelled &bull; W3C traceparent OTLP &bull; Sparse Top-2 MoE &bull; SQLite WAL FTS5 RRF</div>
   </div>
   <div class="card">
     <h2>1. Sparse Top-2 MoE Router</h2>
@@ -142,10 +144,21 @@ def build_server(
     require_session: bool = False,
     session_ring_capacity: int = 32,
     session_ttl_ms: int = 300_000,
+    require_oauth: bool = False,
+    resource_uri: str | None = None,
+    authorization_servers: list[str] | None = None,
+    oauth_guard: OAuthProtectedResourceGuard | None = None,
 ) -> ThreadingHTTPServer:
     dispatcher = create_seeded_dispatcher(max_batch_size=max_batch_size)
     dispatcher.sessions.ring_capacity = max(1, min(64, int(session_ring_capacity)))
     dispatcher.sessions.default_ttl_ms = max(1, int(session_ttl_ms))
+    if oauth_guard is not None:
+        dispatcher.oauth = oauth_guard
+    elif resource_uri is not None or authorization_servers is not None:
+        dispatcher.oauth = OAuthProtectedResourceGuard(
+            resource_uri=resource_uri or "http://127.0.0.1:8090/mcp",
+            authorization_servers=authorization_servers,
+        )
     limiter = rate_limiter or SlidingWindowTokenRateLimiter()
     dispatcher.register_resource(
         "mcp://governance/ratelimit",
@@ -242,13 +255,153 @@ def build_server(
             self.end_headers()
             self.wfile.write(frames)
 
+        def _enforce_oauth_gate(
+            self,
+            *,
+            raw_query: str,
+            required_scopes: int,
+            client_id: str,
+            req_id: Any,
+            base_headers: dict[str, str],
+        ) -> bool:
+            meta_url = dispatcher.oauth.resource_metadata_url()
+            if dispatcher.oauth.has_forbidden_query_token(raw_query):
+                dispatcher.telemetry.record_oauth_challenge_issued()
+                www_hdr = dispatcher.oauth.build_www_authenticate_header(
+                    resource_metadata_url=meta_url,
+                    required_scopes=required_scopes,
+                    error="invalid_request",
+                    error_description="URI query access_token parameter is forbidden by OAuth 2.1",
+                )
+                self._send_json(
+                    400,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32600,
+                            "message": "URI query access_token parameter is forbidden by OAuth 2.1",
+                            "data": {"code": dispatcher.oauth.ERR_BEARER_SYNTAX},
+                        },
+                    },
+                    extra_headers={**base_headers, "WWW-Authenticate": www_hdr},
+                )
+                return False
+
+            auth_hdr = self.headers.get("Authorization")
+            if not require_oauth and auth_hdr is None:
+                return True
+
+            ex_rc, bearer_tok, ex_msg = dispatcher.oauth.extract_bearer_header(auth_hdr)
+            if ex_rc == 1:
+                if not require_oauth:
+                    return True
+                dispatcher.telemetry.record_oauth_challenge_issued()
+                www_hdr = dispatcher.oauth.build_www_authenticate_header(
+                    resource_metadata_url=meta_url,
+                    required_scopes=required_scopes,
+                )
+                self._send_json(
+                    401,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32001,
+                            "message": ex_msg,
+                            "data": {"code": dispatcher.oauth.ERR_TOKEN_INACTIVE},
+                        },
+                    },
+                    extra_headers={**base_headers, "WWW-Authenticate": www_hdr},
+                )
+                return False
+
+            if ex_rc != 0:
+                dispatcher.telemetry.record_oauth_challenge_issued()
+                www_hdr = dispatcher.oauth.build_www_authenticate_header(
+                    resource_metadata_url=meta_url,
+                    required_scopes=required_scopes,
+                    error="invalid_token",
+                    error_description=ex_msg,
+                )
+                self._send_json(
+                    401,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32001, "message": ex_msg, "data": {"code": ex_rc}},
+                    },
+                    extra_headers={**base_headers, "WWW-Authenticate": www_hdr},
+                )
+                return False
+
+            in_rc, _, in_msg = dispatcher.oauth.introspect_token(
+                bearer_tok,
+                required_scopes=required_scopes,
+                client_id=client_id,
+            )
+            if in_rc == 0:
+                dispatcher.telemetry.record_oauth_token_verified()
+                return True
+
+            dispatcher.telemetry.record_oauth_challenge_issued()
+            if in_rc == dispatcher.oauth.ERR_TOKEN_AUDIENCE:
+                dispatcher.telemetry.record_oauth_audience_rejection()
+            if in_rc == dispatcher.oauth.ERR_TOKEN_SCOPE:
+                dispatcher.telemetry.record_oauth_scope_rejection()
+                www_hdr = dispatcher.oauth.build_www_authenticate_header(
+                    resource_metadata_url=meta_url,
+                    required_scopes=required_scopes,
+                    error="insufficient_scope",
+                    error_description=in_msg,
+                )
+                self._send_json(
+                    403,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {"code": -32005, "message": in_msg, "data": {"code": in_rc}},
+                    },
+                    extra_headers={**base_headers, "WWW-Authenticate": www_hdr},
+                )
+                return False
+
+            www_hdr = dispatcher.oauth.build_www_authenticate_header(
+                resource_metadata_url=meta_url,
+                required_scopes=required_scopes,
+                error="invalid_token",
+                error_description=in_msg,
+            )
+            self._send_json(
+                401,
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32001, "message": in_msg, "data": {"code": in_rc}},
+                },
+                extra_headers={**base_headers, "WWW-Authenticate": www_hdr},
+            )
+            return False
+
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed_url = urllib.parse.urlsplit(self.path)
+            route_path = parsed_url.path
+            if route_path in (
+                "/.well-known/oauth-protected-resource",
+                "/.well-known/oauth-protected-resource/mcp",
+            ):
+                self._send_json(
+                    200,
+                    dispatcher.oauth.metadata_document(),
+                    extra_headers={"Cache-Control": "public, max-age=300"},
+                )
+                return
+            if route_path == "/health":
                 self._send_json(
                     200,
                     {
                         "status": "ok",
-                        "version": "1.8.0",
+                        "version": "1.9.0",
                         "protocol": dispatcher.PROTOCOL_VERSION,
                         "documents": dispatcher.vault.count(),
                         "router": dispatcher.router.stats(),
@@ -260,20 +413,29 @@ def build_server(
                         "progress": dispatcher.progress.snapshot(),
                         "approvals": dispatcher.approvals.snapshot(),
                         "sessions": dispatcher.sessions.snapshot(),
+                        "oauth": dispatcher.oauth.snapshot(),
                     },
                 )
                 return
-            if self.path == "/metrics/otlp":
+            if route_path == "/metrics/otlp":
                 self._send_json(200, dispatcher.telemetry.export_otlp_json())
                 return
-            if self.path == "/mcp/notifications":
+            if route_path == "/mcp/notifications":
                 self._send_json(200, {"notifications": dispatcher.drain_notifications()})
                 return
-            if self.path == "/mcp":
+            if route_path == "/mcp":
                 incoming_tp = self.headers.get("traceparent")
                 client_id = self._resolve_client_id()
                 gw_ctx = dispatcher.telemetry.new_gateway_context(incoming_tp)
                 base_hdrs = {**limiter.to_headers(limiter.check(client_id, 0)), "traceparent": gw_ctx["traceparent"]}
+                if not self._enforce_oauth_gate(
+                    raw_query=parsed_url.query,
+                    required_scopes=dispatcher.oauth.SCOPE_READ,
+                    client_id=client_id,
+                    req_id=None,
+                    base_headers=base_hdrs,
+                ):
+                    return
                 raw_sid = self.headers.get("Mcp-Session-Id")
                 if not raw_sid:
                     self._send_session_error(
@@ -326,13 +488,22 @@ def build_server(
             self.wfile.write(html_bytes)
 
         def do_DELETE(self) -> None:
-            if self.path != "/mcp":
+            parsed_url = urllib.parse.urlsplit(self.path)
+            if parsed_url.path != "/mcp":
                 self._send_json(404, {"error": "Not found"})
                 return
             incoming_tp = self.headers.get("traceparent")
             client_id = self._resolve_client_id()
             gw_ctx = dispatcher.telemetry.new_gateway_context(incoming_tp)
             base_hdrs = {**limiter.to_headers(limiter.check(client_id, 0)), "traceparent": gw_ctx["traceparent"]}
+            if not self._enforce_oauth_gate(
+                raw_query=parsed_url.query,
+                required_scopes=dispatcher.oauth.SCOPE_READ,
+                client_id=client_id,
+                req_id=None,
+                base_headers=base_hdrs,
+            ):
+                return
             raw_sid = self.headers.get("Mcp-Session-Id")
             if not raw_sid:
                 self._send_session_error(
@@ -352,7 +523,8 @@ def build_server(
         def do_POST(self) -> None:
             length = max(0, int(self.headers.get("Content-Length", "0") or "0"))
             raw_bytes = self.rfile.read(length) if length > 0 else b""
-            if self.path != "/mcp":
+            parsed_url = urllib.parse.urlsplit(self.path)
+            if parsed_url.path != "/mcp":
                 self._send_json(404, {"error": "Not found"})
                 return
 
@@ -372,6 +544,22 @@ def build_server(
                     extra_headers=hdrs,
                 )
                 return
+
+            if dispatcher.oauth.has_forbidden_query_token(parsed_url.query) or require_oauth or self.headers.get("Authorization") is not None:
+                gw_oauth = dispatcher.telemetry.new_gateway_context(incoming_tp)
+                req_id_oauth = body.get("id") if isinstance(body, dict) else None
+                base_oauth_hdrs = {
+                    **limiter.to_headers(limiter.check(client_id, 0)),
+                    "traceparent": gw_oauth["traceparent"],
+                }
+                if not self._enforce_oauth_gate(
+                    raw_query=parsed_url.query,
+                    required_scopes=dispatcher.oauth.required_scope_for_payload(body),
+                    client_id=client_id,
+                    req_id=req_id_oauth,
+                    base_headers=base_oauth_hdrs,
+                ):
+                    return
 
             raw_sid = self.headers.get("Mcp-Session-Id")
             active_sid: str | None = None
@@ -490,6 +678,11 @@ def build_server(
             self._send_json(status_code, resp_obj, extra_headers=out_headers)
 
     server = ThreadingHTTPServer((host, port), Handler)
+    if oauth_guard is None and resource_uri is None:
+        bound_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+        bound_port = server.server_address[1]
+        if bound_host in ("127.0.0.1", "localhost", "[::1]"):
+            dispatcher.oauth.set_resource_uri(f"http://{bound_host}:{bound_port}/mcp")
     server.dispatcher = dispatcher  # type: ignore[attr-defined]
     return server
 

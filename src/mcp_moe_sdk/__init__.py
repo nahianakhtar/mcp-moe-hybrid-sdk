@@ -9,6 +9,7 @@ from .engine import (
     JsonSchema2020Validator,
     McpCursorCodec,
     McpJsonRpcDispatcher,
+    OAuthProtectedResourceGuard,
     OtlpTelemetryExporter,
     ProgressReporter,
     ProgressTokenRegistry,
@@ -34,6 +35,7 @@ __all__ = [
     "JsonSchema2020Validator",
     "McpCursorCodec",
     "McpJsonRpcDispatcher",
+    "OAuthProtectedResourceGuard",
     "OtlpTelemetryExporter",
     "ProgressReporter",
     "ProgressTokenRegistry",
@@ -49,4 +51,4 @@ __all__ = [
     "crc32c",
     "estimate_mcp_tokens",
 ]
-__version__ = "1.8.0"
+__version__ = "1.9.0"

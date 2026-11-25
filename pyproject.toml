@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-moe-hybrid-sdk"
-version = "1.8.0"
-description = "Production AI SDK combining Model Context Protocol (MCP 2025-11-25 Streamable HTTP batching, Mcp-Session-Id cryptographic session binding & Last-Event-ID SSE event-ring replay resumability, ResourceLink provenance seals & audio/image content Annotations, elicitation/create flat-schema & sampling/createMessage Human-in-the-Loop governance, monotonic notifications/progress tokens, roots/list RFC 8089 URI confinement, CRC32C cursor pagination, completion/complete, resource subscriptions, RFC 5424 logging, JSON-Schema 2020-12 outputSchema structuredContent & notifications/cancelled tokens), W3C traceparent OTLP JSON Telemetry, Sliding-Window Token Rate Limiting, Sparse Top-2 MoE Routing, and SQLite WAL FTS5 Hybrid RAG."
+version = "1.9.0"
+description = "Production AI SDK combining Model Context Protocol (MCP 2025-11-25 Streamable HTTP batching, OAuth 2.1 RFC 9728 Protected Resource Metadata, RFC 7636 PKCE S256 & RFC 8707/6750 audience-bound Bearer token introspection, Mcp-Session-Id cryptographic session binding & Last-Event-ID SSE event-ring replay resumability, ResourceLink provenance seals & audio/image content Annotations, elicitation/create flat-schema & sampling/createMessage Human-in-the-Loop governance, monotonic notifications/progress tokens, roots/list RFC 8089 URI confinement, CRC32C cursor pagination, completion/complete, resource subscriptions, RFC 5424 logging, JSON-Schema 2020-12 outputSchema structuredContent & notifications/cancelled tokens), W3C traceparent OTLP JSON Telemetry, Sliding-Window Token Rate Limiting, Sparse Top-2 MoE Routing, and SQLite WAL FTS5 Hybrid RAG."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

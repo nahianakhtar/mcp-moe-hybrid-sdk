@@ -12,7 +12,7 @@ A zero-dependency Python SDK and HTTP server uniting an **MCP `2025-11-25` Strea
 
 - **Zero External Runtime Dependencies**: Runs entirely on Python 3.10+ stdlib and embedded SQLite `WAL`/`FTS5`—no external vector DB, Redis, or orchestration cluster required.
 - **Deterministic VRAM & Latency-SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
-- **Built-In Production Governance**: Enforces secret/PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
+- **Built-In Production Governance**: Enforces secret/PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`OAuthProtectedResourceGuard` RFC 9728 `/.well-known/oauth-protected-resource`, RFC 7636 `PKCE S256`, & RFC 8707/6750 audience-bound `Bearer` introspection, `Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
 - **Offline Determinism**: Every unit test, protocol check, and golden-dataset benchmark runs deterministically offline with zero external API keys.
 
 ---
@@ -56,8 +56,8 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 ### Containerized Deployment
 
 ```bash
-docker build -t mcp-moe-hybrid-sdk:1.8.0 .
-docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.8.0
+docker build -t mcp-moe-hybrid-sdk:1.9.0 .
+docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.9.0
 ```
 
 ---
@@ -134,7 +134,7 @@ PYTHONPATH=src .venv/bin/python benchmarks/run_golden_eval.py
 | Check | Scope | Verified Result |
 | :--- | :--- | :--- |
 | **Lint (`ruff`)** | Full repository | `All checks passed!` |
-| **Test Suite (`pytest`)** | Offline unit, protocol & edge-case tests | `40 passed` |
+| **Test Suite (`pytest`)** | Offline unit, protocol & edge-case tests | `42 passed` |
 | **Golden Eval (`benchmarks/run_golden_eval.py`)** | `100` RAG queries + `100` MoE routing queries (`0` external deps) | `1.0000` (`100%`) Recall@1 (`0.2396 ms` p50 / `0.3762 ms` p95); `1.0000` (`100%`) Router Accuracy (`0.0081 ms` p50 / `0.0123 ms` p95); latencies vary by hardware |
 
 ---

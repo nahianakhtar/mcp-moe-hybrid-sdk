@@ -17,6 +17,7 @@ from mcp_moe_sdk.engine import (
     JsonSchema2020Validator,
     McpCursorCodec,
     McpJsonRpcDispatcher,
+    OAuthProtectedResourceGuard,
     OtlpTelemetryExporter,
     ProgressReporter,
     ProgressTokenRegistry,
@@ -121,7 +122,7 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
             )
             with opener.open(init_req, timeout=5) as iresp:
                 init_body = json.loads(iresp.read().decode("utf-8"))["result"]
-                self.assertEqual(init_body["serverInfo"]["version"], "1.8.0")
+                self.assertEqual(init_body["serverInfo"]["version"], "1.9.0")
                 self.assertIsNotNone(iresp.headers.get("Mcp-Session-Id"))
                 self.assertIn("resources", init_body["capabilities"])
                 self.assertIn("prompts", init_body["capabilities"])
@@ -531,7 +532,7 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
 
             with opener.open(f"http://127.0.0.1:{port}/health", timeout=5) as hresp:
                 health = json.loads(hresp.read().decode("utf-8"))
-                self.assertEqual(health["version"], "1.8.0")
+                self.assertEqual(health["version"], "1.9.0")
                 self.assertEqual(health["rate_limit"]["total_allowed"], 2)
                 self.assertEqual(health["rate_limit"]["total_rejected"], 1)
         finally:
@@ -887,7 +888,7 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
             vault.upsert(f"doc-{idx:02d}", f"Doc {idx}", f"Body content for document {idx}.", ["rag"])
         disp = McpJsonRpcDispatcher(vault=vault, page_size=2)
 
-        # Paginate resources/list (8 built-in governance/telemetry resources + 5 vault docs = 13 total)
+        # Paginate resources/list (9 built-in governance/telemetry resources + 5 vault docs = 14 total)
         collected_uris: list[str] = []
         cursor: str | None = None
         pages = 0
@@ -903,8 +904,8 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
             if cursor is None:
                 break
         self.assertEqual(pages, 7)
-        self.assertEqual(len(collected_uris), 13)
-        self.assertEqual(len(set(collected_uris)), 13)
+        self.assertEqual(len(collected_uris), 14)
+        self.assertEqual(len(set(collected_uris)), 14)
 
         # Cross-endpoint replay: passing a tools/list cursor into resources/list must fail with -32602
         t_page1 = disp.handle({"jsonrpc": "2.0", "id": 201, "method": "tools/list"})["result"]
@@ -1974,6 +1975,326 @@ class TestMcpMoeHybridSdk(unittest.TestCase):
                 self.assertEqual(h["sessions"]["sessions_terminated"], 1)
                 self.assertEqual(h["telemetry"]["sessions_opened"], 1)
                 self.assertEqual(h["telemetry"]["sse_events_replayed"], 2)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_v19_oauth21_pkce_s256_resource_uri_and_c11_ctypes_parity(self) -> None:
+        import ctypes
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        # 1. RFC 7636 Appendix B canonical S256 vector & plain-method rejection (-43 / -44)
+        rfc_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        rfc_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        rc_pkce, ch_out, _ = OAuthProtectedResourceGuard.compute_pkce_s256(rfc_verifier)
+        self.assertEqual((rc_pkce, ch_out), (0, rfc_challenge))
+        self.assertEqual(OAuthProtectedResourceGuard.verify_pkce_s256(rfc_verifier, rfc_challenge)[0], 0)
+        self.assertEqual(
+            OAuthProtectedResourceGuard.verify_pkce_s256(rfc_verifier, rfc_challenge, method="plain")[0],
+            OAuthProtectedResourceGuard.ERR_PKCE_CHALLENGE,
+        )
+        self.assertEqual(
+            OAuthProtectedResourceGuard.compute_pkce_s256("short-verifier")[0],
+            OAuthProtectedResourceGuard.ERR_PKCE_VERIFIER,
+        )
+        # Non-canonical 43rd sextet low-2-bit check -> -44
+        self.assertEqual(
+            OAuthProtectedResourceGuard.verify_pkce_s256(rfc_verifier, rfc_challenge[:-1] + "N")[0],
+            OAuthProtectedResourceGuard.ERR_PKCE_CHALLENGE,
+        )
+
+        # 2. RFC 9728 / RFC 8707 canonical resource URI & C11 audience CRC32C vector (0xC4EC1DE9)
+        rc_u, canon_u, aud_crc, _ = OAuthProtectedResourceGuard.normalize_resource_uri(
+            "HTTPS://MCP.Example.COM:443/v1//mcp/"
+        )
+        self.assertEqual((rc_u, canon_u, aud_crc), (0, "https://mcp.example.com/v1/mcp", 0xC4EC1DE9))
+        self.assertEqual(
+            OAuthProtectedResourceGuard.normalize_resource_uri("http://127.0.0.1:80/mcp/")[1],
+            "http://127.0.0.1/mcp",
+        )
+        for bad_uri in (
+            "http://mcp.example.com/v1/mcp",
+            "https://mcp.example.com/v1/mcp#frag",
+            "https://mcp.example.com/v1/mcp?x=1",
+            "https://user@mcp.example.com/v1/mcp",
+            "https://mcp.example.com/v1/../admin",
+            "https://mcp.example.com/v1/%2fadmin",
+        ):
+            self.assertEqual(
+                OAuthProtectedResourceGuard.normalize_resource_uri(bad_uri)[0],
+                OAuthProtectedResourceGuard.ERR_OAUTH_RESOURCE_URI,
+            )
+
+        # 3. Token registration (zero plaintext storage), TTL expiry, revocation, audience & scope checks
+        clock_ms = [1_000]
+        guard = OAuthProtectedResourceGuard(
+            "https://mcp.example.com/v1/mcp",
+            authorization_servers=["https://auth.example.com/"],
+            max_slots=2,
+            default_ttl_ms=5_000,
+            now_ms_fn=lambda: clock_ms[0],
+        )
+        raw_secret = "mcp_live_tok_9876543210abcdef=="
+        reg_rc, reg_meta, _ = guard.register_token(
+            raw_secret,
+            scopes=["mcp:read", "mcp:tools"],
+            client_id="tenant-o1",
+        )
+        self.assertEqual(reg_rc, 0)
+        assert reg_meta is not None
+        self.assertEqual(reg_meta["audienceCrc32c"], 0xC4EC1DE9)
+        # Ensure raw plaintext token is NEVER stored anywhere in guard._slots
+        self.assertNotIn(raw_secret, repr(guard._slots))
+
+        # Valid introspection -> 0; wrong audience -> -48; missing scope -> -49; wrong client -> -47
+        self.assertEqual(
+            guard.introspect_token(raw_secret, required_scopes="mcp:read mcp:tools", client_id="tenant-o1")[0],
+            0,
+        )
+        self.assertEqual(
+            guard.introspect_token(
+                raw_secret,
+                expected_audience_uri="https://evil.example.org/v1/mcp",
+                required_scopes="mcp:read",
+                client_id="tenant-o1",
+            )[0],
+            OAuthProtectedResourceGuard.ERR_TOKEN_AUDIENCE,
+        )
+        self.assertEqual(
+            guard.introspect_token(raw_secret, required_scopes="mcp:sampling", client_id="tenant-o1")[0],
+            OAuthProtectedResourceGuard.ERR_TOKEN_SCOPE,
+        )
+        self.assertEqual(
+            guard.introspect_token(raw_secret, required_scopes="mcp:read", client_id="attacker")[0],
+            OAuthProtectedResourceGuard.ERR_TOKEN_INACTIVE,
+        )
+
+        # Advance past 5_000 ms TTL -> -47 ERR_TOKEN_INACTIVE
+        clock_ms[0] = 6_001
+        self.assertEqual(
+            guard.introspect_token(raw_secret, required_scopes="mcp:read", client_id="tenant-o1")[0],
+            OAuthProtectedResourceGuard.ERR_TOKEN_INACTIVE,
+        )
+
+        # 4. Live C11 FFI ctypes parity check when sibling C11 kernel source and cc are present
+        c_src = (
+            Path(__file__).resolve().parents[2]
+            / ".."
+            / "polyglot-portfolio-2026"
+            / "polyglot-agent-runtime-rs"
+            / "c_src"
+            / "ring_crc.c"
+        ).resolve()
+        cc_bin = shutil.which("cc")
+        if c_src.is_file() and cc_bin:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                so_path = Path(tmpdir) / "libring_crc.so"
+                subprocess.run(
+                    [cc_bin, "-std=c11", "-O2", "-shared", "-fPIC", str(c_src), "-o", str(so_path)],
+                    check=True,
+                )
+                lib = ctypes.CDLL(str(so_path))
+                out_b64 = ctypes.create_string_buffer(64)
+                v_bytes = rfc_verifier.encode("ascii")
+                c_rc = lib.par_pkce_compute_s256(v_bytes, len(v_bytes), out_b64, 64)
+                self.assertEqual(c_rc, 0)
+                self.assertEqual(out_b64.raw[:43].decode("ascii"), ch_out)
+
+                uri_in = b"HTTPS://MCP.Example.COM:443/v1//mcp/"
+                canon_buf = ctypes.create_string_buffer(256)
+                out_len = ctypes.c_size_t(0)
+                out_crc = ctypes.c_uint32(0)
+                u_rc = lib.par_oauth_normalize_resource_uri(
+                    uri_in,
+                    len(uri_in),
+                    canon_buf,
+                    256,
+                    ctypes.byref(out_len),
+                    ctypes.byref(out_crc),
+                )
+                self.assertEqual(u_rc, 0)
+                self.assertEqual(canon_buf.raw[: out_len.value].decode("ascii"), canon_u)
+                self.assertEqual(out_crc.value, aud_crc)
+
+    def test_v19_http_well_known_protected_resource_bearer_audience_and_scope_step_up(self) -> None:
+        srv = build_server(
+            "127.0.0.1",
+            0,
+            require_oauth=True,
+            resource_uri="https://mcp.example.com/mcp",
+            authorization_servers=["https://auth.example.com"],
+        )
+        port = srv.server_address[1]
+        oauth: OAuthProtectedResourceGuard = srv.dispatcher.oauth  # type: ignore[attr-defined]
+        read_tok = "tok_read_only_1234567890abcdef"
+        tools_tok = "tok_read_tools_1234567890abcdef"
+        wrong_aud_tok = "tok_other_server_1234567890abcdef"
+        oauth.register_token(read_tok, scopes=["mcp:read"], client_id="oauth-client-1")
+        oauth.register_token(tools_tok, scopes=["mcp:read", "mcp:tools"], client_id="oauth-client-1")
+        oauth.register_token(
+            wrong_aud_tok,
+            audience_uri="https://other-mcp.example.org/mcp",
+            scopes=["mcp:read", "mcp:tools"],
+            client_id="oauth-client-1",
+        )
+
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            # 1. RFC 9728 well-known Protected Resource Metadata discovery (both root and /mcp suffix)
+            for wk in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
+                with opener.open(f"http://127.0.0.1:{port}{wk}", timeout=5) as wresp:
+                    self.assertEqual(wresp.status, 200)
+                    meta = json.loads(wresp.read().decode("utf-8"))
+                    self.assertEqual(meta["resource"], "https://mcp.example.com/mcp")
+                    self.assertEqual(meta["authorization_servers"], ["https://auth.example.com"])
+                    self.assertEqual(meta["bearer_methods_supported"], ["header"])
+                    self.assertEqual(meta["code_challenge_methods_supported"], ["S256"])
+
+            # 2. Query-string ?access_token= leak attempt -> 400 (-46)
+            leak_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp?access_token={tools_tok}",
+                data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Client-Id": "oauth-client-1"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_leak:
+                opener.open(leak_req, timeout=5)
+            self.assertEqual(ctx_leak.exception.code, 400)
+            self.assertIn('error="invalid_request"', ctx_leak.exception.headers.get("WWW-Authenticate", ""))
+            ctx_leak.exception.close()
+
+            # 3. Missing Authorization header -> 401 with WWW-Authenticate resource_metadata (no error= per RFC 6750 §3.1)
+            unauth_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Client-Id": "oauth-client-1"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_unauth:
+                opener.open(unauth_req, timeout=5)
+            self.assertEqual(ctx_unauth.exception.code, 401)
+            www_unauth = ctx_unauth.exception.headers.get("WWW-Authenticate", "")
+            self.assertIn(
+                'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"',
+                www_unauth,
+            )
+            self.assertNotIn("error=", www_unauth)
+            ctx_unauth.exception.close()
+
+            # 4. Confused-deputy replay of token minted for another MCP server -> 401 (-48 ERR_TOKEN_AUDIENCE)
+            aud_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Client-Id": "oauth-client-1",
+                    "Authorization": f"Bearer {wrong_aud_tok}",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_aud:
+                opener.open(aud_req, timeout=5)
+            self.assertEqual(ctx_aud.exception.code, 401)
+            aud_err = json.loads(ctx_aud.exception.read().decode("utf-8"))
+            self.assertEqual(aud_err["error"]["data"]["code"], OAuthProtectedResourceGuard.ERR_TOKEN_AUDIENCE)
+            ctx_aud.exception.close()
+
+            # 5. mcp:read token succeeds on tools/list (200), then receives 403 insufficient_scope (-49) on tools/call
+            list_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Client-Id": "oauth-client-1",
+                    "Authorization": f"Bearer {read_tok}",
+                },
+            )
+            with opener.open(list_req, timeout=5) as lresp:
+                self.assertEqual(lresp.status, 200)
+
+            stepup_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 5,
+                        "method": "tools/call",
+                        "params": {"name": "moe_route_query", "arguments": {"prompt": "Return JSON ping"}},
+                    }
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Client-Id": "oauth-client-1",
+                    "Authorization": f"Bearer {read_tok}",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_scope:
+                opener.open(stepup_req, timeout=5)
+            self.assertEqual(ctx_scope.exception.code, 403)
+            www_scope = ctx_scope.exception.headers.get("WWW-Authenticate", "")
+            self.assertIn('error="insufficient_scope"', www_scope)
+            self.assertIn('scope="mcp:read mcp:tools"', www_scope)
+            scope_err = json.loads(ctx_scope.exception.read().decode("utf-8"))
+            self.assertEqual(scope_err["error"]["data"]["code"], OAuthProtectedResourceGuard.ERR_TOKEN_SCOPE)
+            ctx_scope.exception.close()
+
+            # 6. Step-up to mcp:read + mcp:tools token -> tools/call & resources/read mcp://governance/oauth succeed (200)
+            call_ok_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps(
+                    [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 6,
+                            "method": "tools/call",
+                            "params": {"name": "moe_route_query", "arguments": {"prompt": "Return JSON ping"}},
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 7,
+                            "method": "resources/read",
+                            "params": {"uri": "mcp://governance/oauth"},
+                        },
+                    ]
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Client-Id": "oauth-client-1",
+                    "Authorization": f"Bearer {tools_tok}",
+                },
+            )
+            with opener.open(call_ok_req, timeout=5) as ok_resp:
+                self.assertEqual(ok_resp.status, 200)
+                batch_out = json.loads(ok_resp.read().decode("utf-8"))
+                self.assertEqual(len(batch_out), 2)
+                oauth_res_snap = json.loads(batch_out[1]["result"]["contents"][0]["text"])
+                self.assertEqual(oauth_res_snap["audience_crc32c"], crc32c(b"https://mcp.example.com/mcp"))
+
+            # 7. Revoke tools_tok -> subsequent call fails with 401 (-47 ERR_TOKEN_INACTIVE)
+            self.assertEqual(oauth.revoke_token(tools_tok)[0], 0)
+            revoked_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/mcp",
+                data=json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Client-Id": "oauth-client-1",
+                    "Authorization": f"Bearer {tools_tok}",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_rev:
+                opener.open(revoked_req, timeout=5)
+            self.assertEqual(ctx_rev.exception.code, 401)
+            ctx_rev.exception.close()
+
+            with opener.open(f"http://127.0.0.1:{port}/health", timeout=5) as hresp:
+                h = json.loads(hresp.read().decode("utf-8"))
+                self.assertEqual(h["version"], "1.9.0")
+                self.assertEqual(h["telemetry"]["oauth_tokens_verified"], 2)
+                self.assertEqual(h["telemetry"]["oauth_audience_rejections"], 1)
+                self.assertEqual(h["telemetry"]["oauth_scope_rejections"], 1)
+                self.assertGreaterEqual(h["telemetry"]["oauth_challenges_issued"], 5)
         finally:
             srv.shutdown()
             srv.server_close()

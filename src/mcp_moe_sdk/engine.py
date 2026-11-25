@@ -1581,7 +1581,7 @@ class OtlpTelemetryExporter:
     def __init__(
         self,
         service_name: str = "mcp-moe-hybrid-sdk",
-        service_version: str = "1.8.0",
+        service_version: str = "1.9.0",
         max_spans: int = 256,
         span_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
@@ -1607,6 +1607,11 @@ class OtlpTelemetryExporter:
         self.sse_events_replayed = 0
         self.resource_links_emitted = 0
         self.annotation_rejections = 0
+        self.oauth_tokens_verified = 0
+        self.oauth_challenges_issued = 0
+        self.oauth_audience_rejections = 0
+        self.oauth_scope_rejections = 0
+        self.pkce_verifications = 0
         self._histograms: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -1750,6 +1755,26 @@ class OtlpTelemetryExporter:
         with self._lock:
             self.annotation_rejections += 1
 
+    def record_oauth_token_verified(self) -> None:
+        with self._lock:
+            self.oauth_tokens_verified += 1
+
+    def record_oauth_challenge_issued(self) -> None:
+        with self._lock:
+            self.oauth_challenges_issued += 1
+
+    def record_oauth_audience_rejection(self) -> None:
+        with self._lock:
+            self.oauth_audience_rejections += 1
+
+    def record_oauth_scope_rejection(self) -> None:
+        with self._lock:
+            self.oauth_scope_rejections += 1
+
+    def record_pkce_verification(self) -> None:
+        with self._lock:
+            self.pkce_verifications += 1
+
     def record_tool_call(
         self,
         tool_name: str,
@@ -1869,6 +1894,11 @@ class OtlpTelemetryExporter:
             sse_replayed = self.sse_events_replayed
             rlinks_emitted = self.resource_links_emitted
             ann_rejected = self.annotation_rejections
+            oauth_verified = self.oauth_tokens_verified
+            oauth_challenges = self.oauth_challenges_issued
+            oauth_aud_rejected = self.oauth_audience_rejections
+            oauth_scope_rejected = self.oauth_scope_rejections
+            pkce_checks = self.pkce_verifications
             dp_hist = []
             for tool_name, h in sorted(self._histograms.items()):
                 dp_hist.append(
@@ -1982,6 +2012,11 @@ class OtlpTelemetryExporter:
                 "sse_events_replayed": sse_replayed,
                 "resource_links_emitted": rlinks_emitted,
                 "annotation_rejections": ann_rejected,
+                "oauth_tokens_verified": oauth_verified,
+                "oauth_challenges_issued": oauth_challenges,
+                "oauth_audience_rejections": oauth_aud_rejected,
+                "oauth_scope_rejections": oauth_scope_rejected,
+                "pkce_verifications": pkce_checks,
             },
         }
 
@@ -3272,6 +3307,585 @@ class StreamableSessionRegistry:
             }
 
 
+_PKCE_UNRESERVED_BYTES: frozenset[int] = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+)
+_B64URL_ALPHABET: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+class OAuthProtectedResourceGuard:
+    """MCP 2025-11-25 OAuth 2.1 Protected Resource Metadata (RFC 9728), PKCE S256 (RFC 7636), & RFC 8707/6750 Audience-Bound Bearer Token Introspection Guard."""
+
+    ERR_PKCE_VERIFIER: int = -43
+    ERR_PKCE_CHALLENGE: int = -44
+    ERR_OAUTH_RESOURCE_URI: int = -45
+    ERR_BEARER_SYNTAX: int = -46
+    ERR_TOKEN_INACTIVE: int = -47
+    ERR_TOKEN_AUDIENCE: int = -48
+    ERR_TOKEN_SCOPE: int = -49
+    ERR_TOKEN_FULL: int = -50
+
+    SCOPE_READ: int = 0x01
+    SCOPE_TOOLS: int = 0x02
+    SCOPE_PROMPTS: int = 0x04
+    SCOPE_SAMPLING: int = 0x08
+    SCOPE_ALL: int = 0x0F
+
+    SCOPE_DEFINITIONS: tuple[tuple[int, str], ...] = (
+        (0x01, "mcp:read"),
+        (0x02, "mcp:tools"),
+        (0x04, "mcp:prompts"),
+        (0x08, "mcp:sampling"),
+    )
+
+    MIN_PKCE_VERIFIER_LEN: int = 43
+    MAX_PKCE_VERIFIER_LEN: int = 128
+    PKCE_S256_B64_LEN: int = 43
+    MAX_BEARER_LEN: int = 512
+    MAX_RESOURCE_URI_LEN: int = 256
+
+    def __init__(
+        self,
+        resource_uri: str = "https://mcp.example.com/mcp",
+        *,
+        authorization_servers: list[str] | None = None,
+        max_slots: int = 64,
+        default_ttl_ms: int = 300_000,
+        now_ms_fn: Callable[[], int] | None = None,
+    ) -> None:
+        rc, canon_uri, aud_crc, msg = self.normalize_resource_uri(resource_uri)
+        if rc != 0:
+            raise ValueError(f"Invalid OAuth protected resource URI {resource_uri!r}: {msg} ({rc})")
+        self._resource_uri = canon_uri
+        self._audience_crc32c = aud_crc
+        raw_as = authorization_servers or ["https://auth.example.com"]
+        canon_as: list[str] = []
+        for srv_uri in raw_as:
+            as_rc, as_canon, _, as_msg = self.normalize_resource_uri(srv_uri)
+            if as_rc != 0:
+                raise ValueError(f"Invalid OAuth authorization server URI {srv_uri!r}: {as_msg} ({as_rc})")
+            canon_as.append(as_canon)
+        self._authorization_servers = canon_as
+        self.max_slots = max(1, min(64, int(max_slots)))
+        self.default_ttl_ms = max(1, int(default_ttl_ms))
+        self._now_ms_fn: Callable[[], int] = now_ms_fn or (lambda: time.monotonic_ns() // 1_000_000)
+        self._slots: OrderedDict[tuple[int, int], dict[str, Any]] = OrderedDict()
+        self._lock = threading.Lock()
+        self._tokens_registered = 0
+        self._introspections_ok = 0
+        self._tokens_revoked = 0
+        self._tokens_expired = 0
+        self._audience_rejections = 0
+        self._scope_rejections = 0
+        self._inactive_rejections = 0
+        self._pkce_verifications = 0
+
+    @property
+    def resource_uri(self) -> str:
+        return self._resource_uri
+
+    @property
+    def audience_crc32c(self) -> int:
+        return self._audience_crc32c
+
+    @property
+    def authorization_servers(self) -> list[str]:
+        return list(self._authorization_servers)
+
+    def set_resource_uri(self, resource_uri: str) -> tuple[str, int]:
+        rc, canon_uri, aud_crc, msg = self.normalize_resource_uri(resource_uri)
+        if rc != 0:
+            raise ValueError(f"Invalid OAuth protected resource URI {resource_uri!r}: {msg} ({rc})")
+        with self._lock:
+            self._resource_uri = canon_uri
+            self._audience_crc32c = aud_crc
+        return (canon_uri, aud_crc)
+
+    @classmethod
+    def compute_pkce_s256(cls, verifier: Any) -> tuple[int, str, str]:
+        """Compute RFC 7636 S256 PKCE code_challenge bit-identical to C11 par_pkce_compute_s256."""
+        if not isinstance(verifier, str):
+            return (cls.ERR_PKCE_VERIFIER, "", "PKCE code_verifier must be an ASCII string")
+        try:
+            raw = verifier.encode("ascii")
+        except UnicodeEncodeError:
+            return (cls.ERR_PKCE_VERIFIER, "", "PKCE code_verifier contains non-ASCII characters")
+        if len(raw) < cls.MIN_PKCE_VERIFIER_LEN or len(raw) > cls.MAX_PKCE_VERIFIER_LEN:
+            return (cls.ERR_PKCE_VERIFIER, "", "PKCE code_verifier length must be in [43, 128]")
+        for b in raw:
+            if b not in _PKCE_UNRESERVED_BYTES:
+                return (cls.ERR_PKCE_VERIFIER, "", "PKCE code_verifier contains forbidden character outside RFC 7636 §4.1")
+        digest = hashlib.sha256(raw).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        return (0, challenge, "ok")
+
+    @classmethod
+    def verify_pkce_s256(
+        cls,
+        verifier: Any,
+        expected_challenge: Any,
+        *,
+        method: str = "S256",
+    ) -> tuple[int, str]:
+        """Verify RFC 7636 S256 PKCE challenge in constant time, rejecting OAuth 2.1 forbidden 'plain' method."""
+        rc, computed, msg = cls.compute_pkce_s256(verifier)
+        if rc != 0:
+            return (rc, msg)
+        if method != "S256" or not isinstance(expected_challenge, str) or len(expected_challenge) != cls.PKCE_S256_B64_LEN:
+            return (cls.ERR_PKCE_CHALLENGE, "PKCE challenge must use S256 method with 43-char base64url digest")
+        for idx, ch in enumerate(expected_challenge):
+            sx = _B64URL_ALPHABET.find(ch)
+            if sx < 0:
+                return (cls.ERR_PKCE_CHALLENGE, "PKCE challenge contains non-base64url character")
+            if idx == 42 and (sx & 0x03) != 0:
+                return (cls.ERR_PKCE_CHALLENGE, "PKCE challenge has non-canonical trailing base64url bits")
+        if not secrets.compare_digest(computed.encode("ascii"), expected_challenge.encode("ascii")):
+            return (cls.ERR_PKCE_CHALLENGE, "PKCE S256 code_verifier mismatch")
+        return (0, "ok")
+
+    @classmethod
+    def normalize_resource_uri(cls, uri: Any) -> tuple[int, str, int, str]:
+        """Canonicalize RFC 9728 / RFC 8707 resource indicator URI bit-identical to C11 par_oauth_normalize_resource_uri."""
+        if not isinstance(uri, str):
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI must be a string")
+        try:
+            raw = uri.encode("ascii")
+        except UnicodeEncodeError:
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI must be printable ASCII")
+        n = len(raw)
+        if n == 0 or n > cls.MAX_RESOURCE_URI_LEN:
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI length out of bounds")
+        for b in raw:
+            if b < 0x21 or b > 0x7E or b in (0x23, 0x3F, 0x5C, 0x40):  # '#', '?', '\\', '@'
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI contains forbidden query, fragment, userinfo, or control byte")
+
+        low_prefix = raw[:8].lower()
+        if n > 8 and low_prefix == b"https://":
+            is_https = True
+            scheme_len = 8
+        elif n > 7 and raw[:7].lower() == b"http://":
+            is_https = False
+            scheme_len = 7
+        else:
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI must start with https:// or loopback http://")
+
+        slash_pos = raw.find(b"/", scheme_len)
+        if slash_pos == -1:
+            slash_pos = n
+        if slash_pos == scheme_len:
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Resource URI missing authority host")
+
+        auth = raw[scheme_len:slash_pos]
+        port_bytes: bytes | None = None
+        if auth.startswith(b"["):
+            close_br = auth.find(b"]", 1)
+            if close_br <= 1:
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Malformed IPv6 literal in resource URI")
+            host_raw = auth[: close_br + 1]
+            rest = auth[close_br + 1 :]
+            if rest:
+                if not rest.startswith(b":") or len(rest) == 1:
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Malformed port after IPv6 host")
+                port_bytes = rest[1:]
+        else:
+            colon_idx = auth.find(b":")
+            if colon_idx != -1:
+                host_raw = auth[:colon_idx]
+                port_bytes = auth[colon_idx + 1 :]
+                if not host_raw or not port_bytes or b":" in port_bytes:
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Malformed host:port authority")
+            else:
+                host_raw = auth
+
+        host_low = host_raw.lower()
+        if host_low.startswith(b"["):
+            for idx, b in enumerate(host_low):
+                ok = (
+                    (idx == 0 and b == ord("["))
+                    or (idx == len(host_low) - 1 and b == ord("]"))
+                    or (ord("0") <= b <= ord("9"))
+                    or (ord("a") <= b <= ord("f"))
+                    or b == ord(":")
+                )
+                if not ok:
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Invalid character in IPv6 literal")
+        else:
+            for idx, b in enumerate(host_low):
+                ok = (ord("a") <= b <= ord("z")) or (ord("0") <= b <= ord("9")) or b in (ord("."), ord("-"))
+                if not ok:
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Invalid character in resource host")
+                if (idx == 0 or idx == len(host_low) - 1) and b in (ord("."), ord("-")):
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Invalid leading or trailing punctuation in host")
+                if idx > 0 and b == ord(".") and host_low[idx - 1] == ord("."):
+                    return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Consecutive dots in resource host")
+
+        if not is_https and host_low not in (b"localhost", b"127.0.0.1", b"[::1]"):
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Non-HTTPS resource URI is restricted to loopback hosts")
+
+        keep_port = False
+        if port_bytes is not None:
+            if len(port_bytes) > 5 or port_bytes[0] == ord("0") or not all(ord("0") <= b <= ord("9") for b in port_bytes):
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Invalid port syntax in resource URI")
+            port_val = int(port_bytes.decode("ascii"))
+            if port_val < 1 or port_val > 65535:
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Port out of range in resource URI")
+            keep_port = port_val != (443 if is_https else 80)
+
+        out = bytearray(b"https://" if is_https else b"http://")
+        out.extend(host_low)
+        if keep_port and port_bytes is not None:
+            out.append(ord(":"))
+            out.extend(port_bytes)
+
+        p = slash_pos
+        while p < n:
+            while p < n and raw[p] == ord("/"):
+                p += 1
+            if p >= n:
+                break
+            seg_end = raw.find(b"/", p)
+            if seg_end == -1:
+                seg_end = n
+            seg = raw[p:seg_end]
+            if seg in (b".", b".."):
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Dot-segment traversal forbidden in resource URI")
+            low_seg = seg.lower()
+            if b"%2f" in low_seg or b"%5c" in low_seg or b"%00" in low_seg:
+                return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Encoded slash or null byte forbidden in resource URI")
+            out.append(ord("/"))
+            out.extend(seg)
+            p = seg_end
+
+        if len(out) > cls.MAX_RESOURCE_URI_LEN:
+            return (cls.ERR_OAUTH_RESOURCE_URI, "", 0, "Canonical resource URI exceeds 256 bytes")
+        canon_bytes = bytes(out)
+        return (0, canon_bytes.decode("ascii"), crc32c(canon_bytes), "ok")
+
+    @classmethod
+    def validate_bearer_syntax(cls, token: Any) -> tuple[int, bytes, int, str]:
+        """Validate RFC 6750 §2.1 b64token syntax and derive zero-plaintext SHA-256('OAT1') hi64 slot key."""
+        if not isinstance(token, str):
+            return (cls.ERR_BEARER_SYNTAX, b"", 0, "Bearer token must be a string")
+        try:
+            raw = token.encode("ascii")
+        except UnicodeEncodeError:
+            return (cls.ERR_BEARER_SYNTAX, b"", 0, "Bearer token must be ASCII b64token")
+        if len(raw) == 0 or len(raw) > cls.MAX_BEARER_LEN:
+            return (cls.ERR_BEARER_SYNTAX, b"", 0, "Bearer token length must be in [1, 512]")
+        seen_pad = False
+        for idx, b in enumerate(raw):
+            if b == ord("="):
+                if idx == 0:
+                    return (cls.ERR_BEARER_SYNTAX, b"", 0, "Bearer token cannot start with '=' padding")
+                seen_pad = True
+                continue
+            if seen_pad:
+                return (cls.ERR_BEARER_SYNTAX, b"", 0, "Non-padding byte after '=' in Bearer token")
+            if b not in _PKCE_UNRESERVED_BYTES and b not in (ord("+"), ord("/")):
+                return (cls.ERR_BEARER_SYNTAX, b"", 0, "Invalid character in RFC 6750 b64token")
+        digest = hashlib.sha256(raw + b"OAT1").digest()
+        hi64 = int.from_bytes(digest[:8], "big")
+        return (0, raw, hi64, "ok")
+
+    @classmethod
+    def extract_bearer_header(cls, auth_header: Any) -> tuple[int, str, str]:
+        """Parse HTTP Authorization header: returns (1, '', ...) when absent, (0, tok, 'ok') when syntactically valid, or (-46, '', ...)."""
+        if auth_header is None:
+            return (1, "", "Missing Authorization header")
+        if not isinstance(auth_header, str) or not auth_header.strip():
+            return (1, "", "Missing Authorization header")
+        trimmed = auth_header.strip()
+        if len(trimmed) <= 7 or trimmed[:7].lower() != "bearer ":
+            return (cls.ERR_BEARER_SYNTAX, "", "Authorization header must use Bearer scheme")
+        tok = trimmed[7:].strip()
+        if not tok or " " in tok or "\t" in tok:
+            return (cls.ERR_BEARER_SYNTAX, "", "Malformed Bearer credentials in Authorization header")
+        rc, _, _, msg = cls.validate_bearer_syntax(tok)
+        if rc != 0:
+            return (rc, "", msg)
+        return (0, tok, "ok")
+
+    @staticmethod
+    def has_forbidden_query_token(raw_query: str | None) -> bool:
+        """OAuth 2.1 & MCP 2025-11-25 forbid passing access_token in URI query parameters."""
+        if not raw_query:
+            return False
+        for part in raw_query.split("&"):
+            if not part:
+                continue
+            key = part.split("=", 1)[0]
+            if key == "access_token":
+                return True
+        return False
+
+    @classmethod
+    def parse_scope_mask(cls, scopes: int | str | list[str] | tuple[str, ...] | set[str] | None) -> int:
+        if scopes is None:
+            return 0
+        if isinstance(scopes, int) and not isinstance(scopes, bool):
+            return scopes & cls.SCOPE_ALL
+        tokens: list[str]
+        if isinstance(scopes, str):
+            tokens = [s for s in scopes.strip().split() if s]
+        elif isinstance(scopes, (list, tuple, set)):
+            tokens = [str(s).strip() for s in scopes if str(s).strip()]
+        else:
+            return 0
+        mask = 0
+        by_name = {name: bit for bit, name in cls.SCOPE_DEFINITIONS}
+        for tok in tokens:
+            if tok in by_name:
+                mask |= by_name[tok]
+        return mask
+
+    @classmethod
+    def format_scope_list(cls, mask: int) -> list[str]:
+        return [name for bit, name in cls.SCOPE_DEFINITIONS if (mask & bit) != 0]
+
+    @classmethod
+    def required_scope_for_method(cls, method: Any) -> int:
+        if not isinstance(method, str):
+            return cls.SCOPE_READ
+        if method == "tools/call":
+            return cls.SCOPE_READ | cls.SCOPE_TOOLS
+        if method == "prompts/get":
+            return cls.SCOPE_READ | cls.SCOPE_PROMPTS
+        if method in ("sampling/createMessage", "sampling/respond", "elicitation/create", "elicitation/respond"):
+            return cls.SCOPE_READ | cls.SCOPE_SAMPLING
+        return cls.SCOPE_READ
+
+    @classmethod
+    def required_scope_for_payload(cls, payload: Any) -> int:
+        if isinstance(payload, list):
+            mask = cls.SCOPE_READ
+            for item in payload:
+                if isinstance(item, dict):
+                    mask |= cls.required_scope_for_method(item.get("method"))
+            return mask
+        if isinstance(payload, dict):
+            return cls.required_scope_for_method(payload.get("method"))
+        return cls.SCOPE_READ
+
+    @staticmethod
+    def client_fingerprint(client_id: str | None) -> int:
+        cleaned = str(client_id or "").strip()[:128]
+        if not cleaned:
+            return 0
+        fp = crc32c(cleaned.encode("utf-8"))
+        return fp if fp != 0 else 1
+
+    def _sweep_expired_locked(self, now_ms: int) -> None:
+        for slot in self._slots.values():
+            if slot["state"] == "active" and now_ms > slot["expires_ms"]:
+                slot["state"] = "expired"
+                self._tokens_expired += 1
+
+    def verify_pkce(self, verifier: Any, expected_challenge: Any, *, method: str = "S256") -> tuple[int, str]:
+        with self._lock:
+            self._pkce_verifications += 1
+        return self.verify_pkce_s256(verifier, expected_challenge, method=method)
+
+    def register_token(
+        self,
+        token: str,
+        *,
+        audience_uri: str | None = None,
+        scopes: int | str | list[str] = SCOPE_ALL,
+        client_id: str | None = None,
+        ttl_ms: int | None = None,
+    ) -> tuple[int, dict[str, Any] | None, str]:
+        rc_tok, raw_tok, hi64, tok_msg = self.validate_bearer_syntax(token)
+        if rc_tok != 0:
+            return (rc_tok, None, tok_msg)
+        target_uri = self._resource_uri if audience_uri is None else audience_uri
+        rc_uri, canon_aud, aud_crc, uri_msg = self.normalize_resource_uri(target_uri)
+        if rc_uri != 0 or aud_crc == 0:
+            return (self.ERR_OAUTH_RESOURCE_URI, None, uri_msg or "Invalid audience resource URI")
+        scope_mask = self.parse_scope_mask(scopes)
+        eff_ttl = self.default_ttl_ms if ttl_ms is None else max(0, int(ttl_ms))
+        client_crc = self.client_fingerprint(client_id) if client_id else 0
+
+        with self._lock:
+            now_ms = int(self._now_ms_fn())
+            self._sweep_expired_locked(now_ms)
+            key = (hi64, len(raw_tok))
+            if key not in self._slots:
+                active_count = sum(1 for s in self._slots.values() if s["state"] == "active")
+                if active_count >= self.max_slots:
+                    return (self.ERR_TOKEN_FULL, None, "OAuth token introspection table is full")
+                if len(self._slots) >= self.max_slots:
+                    for old_k, old_s in list(self._slots.items()):
+                        if old_s["state"] != "active":
+                            del self._slots[old_k]
+                            break
+            exp_ms = now_ms + eff_ttl
+            self._slots[key] = {
+                "state": "active",
+                "token_len": len(raw_tok),
+                "token_sha256_hi64": hi64,
+                "audience_uri": canon_aud,
+                "audience_crc32c": aud_crc,
+                "scope_mask": scope_mask,
+                "client_crc32c": client_crc,
+                "expires_ms": exp_ms,
+            }
+            self._tokens_registered += 1
+            return (
+                0,
+                {
+                    "audienceUri": canon_aud,
+                    "audienceCrc32c": aud_crc,
+                    "scopeMask": scope_mask,
+                    "scopes": self.format_scope_list(scope_mask),
+                    "clientCrc32c": client_crc,
+                    "expiresAtMs": exp_ms,
+                },
+                "ok",
+            )
+
+    def introspect_token(
+        self,
+        token: Any,
+        *,
+        expected_audience_uri: str | None = None,
+        required_scopes: int | str | list[str] = SCOPE_READ,
+        client_id: str | None = None,
+    ) -> tuple[int, dict[str, Any] | None, str]:
+        rc_tok, raw_tok, hi64, tok_msg = self.validate_bearer_syntax(token)
+        if rc_tok != 0:
+            return (rc_tok, None, tok_msg)
+        if expected_audience_uri is None:
+            exp_crc = self._audience_crc32c
+        else:
+            rc_uri, _, exp_crc, uri_msg = self.normalize_resource_uri(expected_audience_uri)
+            if rc_uri != 0:
+                return (self.ERR_OAUTH_RESOURCE_URI, None, uri_msg)
+        req_mask = self.parse_scope_mask(required_scopes)
+
+        with self._lock:
+            now_ms = int(self._now_ms_fn())
+            self._sweep_expired_locked(now_ms)
+            slot = self._slots.get((hi64, len(raw_tok)))
+            if slot is None or slot["state"] != "active":
+                self._inactive_rejections += 1
+                return (self.ERR_TOKEN_INACTIVE, None, "Bearer token is unknown, expired, or revoked")
+            if slot["client_crc32c"] != 0 and slot["client_crc32c"] != self.client_fingerprint(client_id):
+                self._inactive_rejections += 1
+                return (self.ERR_TOKEN_INACTIVE, None, "Bearer token client binding mismatch")
+            if slot["audience_crc32c"] != exp_crc:
+                self._audience_rejections += 1
+                return (
+                    self.ERR_TOKEN_AUDIENCE,
+                    None,
+                    "Bearer token audience mismatch for this MCP protected resource (RFC 8707)",
+                )
+            if (slot["scope_mask"] & req_mask) != req_mask:
+                self._scope_rejections += 1
+                missing = self.format_scope_list(req_mask & ~slot["scope_mask"])
+                return (
+                    self.ERR_TOKEN_SCOPE,
+                    None,
+                    f"Bearer token lacks required scope(s): {' '.join(missing)}",
+                )
+            self._introspections_ok += 1
+            return (
+                0,
+                {
+                    "active": True,
+                    "audienceUri": slot["audience_uri"],
+                    "audienceCrc32c": slot["audience_crc32c"],
+                    "grantedScopeMask": slot["scope_mask"],
+                    "grantedScopes": self.format_scope_list(slot["scope_mask"]),
+                    "expiresAtMs": slot["expires_ms"],
+                },
+                "ok",
+            )
+
+    def revoke_token(self, token: Any) -> tuple[int, str]:
+        rc_tok, raw_tok, hi64, tok_msg = self.validate_bearer_syntax(token)
+        if rc_tok != 0:
+            return (rc_tok, tok_msg)
+        with self._lock:
+            self._sweep_expired_locked(int(self._now_ms_fn()))
+            slot = self._slots.get((hi64, len(raw_tok)))
+            if slot is None or slot["state"] != "active":
+                return (self.ERR_TOKEN_INACTIVE, "Bearer token is not active")
+            slot["state"] = "revoked"
+            self._tokens_revoked += 1
+            return (0, "ok")
+
+    def resource_metadata_url(self, *, resource_uri: str | None = None) -> str:
+        target = self._resource_uri if resource_uri is None else self.normalize_resource_uri(resource_uri)[1]
+        scheme_end = target.find("://")
+        slash_idx = target.find("/", scheme_end + 3)
+        if slash_idx == -1:
+            return f"{target}/.well-known/oauth-protected-resource"
+        origin = target[:slash_idx]
+        path = target[slash_idx:]
+        return f"{origin}/.well-known/oauth-protected-resource{path}"
+
+    def metadata_document(self, *, resource_uri: str | None = None) -> dict[str, Any]:
+        target = self._resource_uri
+        if resource_uri is not None:
+            rc, canon, _, msg = self.normalize_resource_uri(resource_uri)
+            if rc != 0:
+                raise ValueError(f"Invalid resource_uri: {msg}")
+            target = canon
+        return {
+            "resource": target,
+            "authorization_servers": list(self._authorization_servers),
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": [name for _, name in self.SCOPE_DEFINITIONS],
+            "code_challenge_methods_supported": ["S256"],
+            "resource_signing_alg_values_supported": ["RS256", "ES256"],
+        }
+
+    @classmethod
+    def build_www_authenticate_header(
+        cls,
+        *,
+        resource_metadata_url: str,
+        required_scopes: int | str | list[str] | None = None,
+        error: str | None = None,
+        error_description: str | None = None,
+    ) -> str:
+        safe_meta = str(resource_metadata_url).replace('"', "").replace("\r", "").replace("\n", "")
+        parts = [f'resource_metadata="{safe_meta}"']
+        if required_scopes is not None:
+            mask = cls.parse_scope_mask(required_scopes)
+            scope_str = " ".join(cls.format_scope_list(mask))
+            if scope_str:
+                parts.append(f'scope="{scope_str}"')
+        if error:
+            safe_err = str(error).replace('"', "").replace("\r", "").replace("\n", "")
+            parts.append(f'error="{safe_err}"')
+        if error_description:
+            clean_desc, _ = RedactionGuard.sanitize(str(error_description))
+            safe_desc = clean_desc.replace('"', "'").replace("\r", " ").replace("\n", " ")[:160]
+            parts.append(f'error_description="{safe_desc}"')
+        return "Bearer " + ", ".join(parts)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            self._sweep_expired_locked(int(self._now_ms_fn()))
+            active = sum(1 for s in self._slots.values() if s["state"] == "active")
+            return {
+                "resource_uri": self._resource_uri,
+                "audience_crc32c": self._audience_crc32c,
+                "authorization_servers": list(self._authorization_servers),
+                "active_tokens": active,
+                "max_slots": self.max_slots,
+                "tokens_registered": self._tokens_registered,
+                "introspections_ok": self._introspections_ok,
+                "tokens_revoked": self._tokens_revoked,
+                "tokens_expired": self._tokens_expired,
+                "audience_rejections": self._audience_rejections,
+                "scope_rejections": self._scope_rejections,
+                "inactive_rejections": self._inactive_rejections,
+                "pkce_verifications": self._pkce_verifications,
+            }
+
+
 _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "moe_route_query": {
         "name": "moe_route_query",
@@ -3483,6 +4097,11 @@ _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "sse_events_replayed": {"type": "integer", "minimum": 0},
                         "resource_links_emitted": {"type": "integer", "minimum": 0},
                         "annotation_rejections": {"type": "integer", "minimum": 0},
+                        "oauth_tokens_verified": {"type": "integer", "minimum": 0},
+                        "oauth_challenges_issued": {"type": "integer", "minimum": 0},
+                        "oauth_audience_rejections": {"type": "integer", "minimum": 0},
+                        "oauth_scope_rejections": {"type": "integer", "minimum": 0},
+                        "pkce_verifications": {"type": "integer", "minimum": 0},
                     },
                     "required": [
                         "spans_buffered",
@@ -3505,6 +4124,11 @@ _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "sse_events_replayed",
                         "resource_links_emitted",
                         "annotation_rejections",
+                        "oauth_tokens_verified",
+                        "oauth_challenges_issued",
+                        "oauth_audience_rejections",
+                        "oauth_scope_rejections",
+                        "pkce_verifications",
                     ],
                     "additionalProperties": False,
                 },
@@ -3551,6 +4175,7 @@ class McpJsonRpcDispatcher:
         progress: ProgressTokenRegistry | None = None,
         approvals: HumanApprovalRegistry | None = None,
         sessions: StreamableSessionRegistry | None = None,
+        oauth: OAuthProtectedResourceGuard | None = None,
         enforce_approval_capabilities: bool = False,
         span_hook: Callable[[dict[str, Any]], None] | None = None,
         rag_cache_capacity: int = 128,
@@ -3572,6 +4197,7 @@ class McpJsonRpcDispatcher:
         self.progress = progress or ProgressTokenRegistry()
         self.approvals = approvals or HumanApprovalRegistry()
         self.sessions = sessions or StreamableSessionRegistry()
+        self.oauth = oauth or OAuthProtectedResourceGuard()
         self.enforce_approval_capabilities = bool(enforce_approval_capabilities)
         self._rag_cache: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
         self._rag_cache_capacity = max(0, rag_cache_capacity)
@@ -3755,6 +4381,7 @@ class McpJsonRpcDispatcher:
             "mcp://governance/progress",
             "mcp://governance/approvals",
             "mcp://governance/sessions",
+            "mcp://governance/oauth",
         ) or uri in self._custom_resources:
             return True
         if uri.startswith("vault://documents/"):
@@ -3936,6 +4563,12 @@ class McpJsonRpcDispatcher:
                 "uri": "mcp://governance/sessions",
                 "name": "MCP Streamable HTTP Session & Last-Event-ID Replay Ring",
                 "description": "Active Mcp-Session-Id bindings, bounded SSE event replay rings, and replay/termination counters.",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "mcp://governance/oauth",
+                "name": "MCP OAuth 2.1 Protected Resource & Audience Token Guard",
+                "description": "RFC 9728 protected resource metadata, PKCE S256 verification counters, and RFC 8707 audience-bound token introspection state.",
                 "mimeType": "application/json",
             },
         ]
@@ -4201,7 +4834,7 @@ class McpJsonRpcDispatcher:
                         "id": req_id,
                         "result": {
                             "protocolVersion": negotiated_version,
-                            "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.8.0"},
+                            "serverInfo": {"name": "mcp-moe-hybrid-sdk", "version": "1.9.0"},
                             "capabilities": {
                                 "tools": {"listChanged": False},
                                 "resources": {"subscribe": True, "listChanged": False},
@@ -4481,6 +5114,9 @@ class McpJsonRpcDispatcher:
                     mime = "application/json"
                 elif uri == "mcp://governance/sessions":
                     text = json.dumps(self.sessions.snapshot())
+                    mime = "application/json"
+                elif uri == "mcp://governance/oauth":
+                    text = json.dumps(self.oauth.snapshot())
                     mime = "application/json"
                 elif uri in self._custom_resources:
                     meta, reader = self._custom_resources[uri]
