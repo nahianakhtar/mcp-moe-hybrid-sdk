@@ -4,53 +4,57 @@
 [![MCP Spec](https://img.shields.io/badge/MCP-2025--11--25-blue.svg)](https://modelcontextprotocol.io/specification/2025-11-25)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)](pyproject.toml)
 
-Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` Streamable HTTP JSON-RPC 2.0 Batching, `Mcp-Session-Id` Cryptographic Binding + `Last-Event-ID` SSE Event-Ring Replay (`-36`..`-41`) + `DELETE /mcp` Termination, `ResourceLink` & `Annotations` (`audience`, `priority`, leap-year ISO-8601 `lastModified`) `21 B` `CRC32C` Provenance Sealing (`-42`), `elicitation/create` Flat-Schema & `sampling/createMessage` Human-in-the-Loop Governance (`-29`..`-35`), `_meta.progressToken` Monotonic `notifications/progress` Streaming, `roots/list` RFC 8089 Canonical `file://` URI Confinement, C11-Identical `CRC32C` Cursor Pagination across `tools/resources/prompts`, `completion/complete` Autocomplete, `resources/subscribe` Change Notifications, RFC 5424 `logging/setLevel`, `ToolAnnotations`, JSON-Schema `2020-12` `inputSchema`/`outputSchema` `structuredContent` Validation & Cooperative `notifications/cancelled` Tokens)**, **W3C `traceparent` Distributed Trace Propagation + Castagnoli `CRC32C` Deterministic Child-Span Derivation + OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, **Deterministic Sliding-Window Token-Budget Rate Limiting (`X-RateLimit-*` / `Retry-After`)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 Highlighted Citation Spans + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, and **Deterministic Secret/PII Redaction**.
+A zero-dependency Python SDK and HTTP server uniting an **MCP `2025-11-25` Streamable JSON-RPC 2.0 server**, a **hardware- and SLA-aware Sparse Top-2 MoE router**, and an **embedded SQLite WAL (`FTS5` BM25 + dense vector cosine RRF) Hybrid RAG engine**. Designed for deterministic local evaluation, strict governance, and single-container deployment without external vector databases or API keys.
 
 ---
 
-## System Architecture
+## Problem Solved
+
+- **Zero External Runtime Dependencies**: Runs entirely on Python 3.10+ stdlib and embedded SQLite `WAL`/`FTS5`—no external vector DB, Redis, or orchestration cluster required.
+- **Deterministic VRAM & Latency-SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
+- **Built-In Production Governance**: Enforces secret/PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
+- **Offline Determinism**: Every unit test, protocol check, and golden-dataset benchmark runs deterministically offline with zero external API keys.
+
+---
+
+## Architecture Overview
 
 ```mermaid
 flowchart LR
-    Client["SDK / Bento Web UI / Agent Host"] -->|"POST /mcp (Single or Batch + W3C traceparent)"| Limiter["SlidingWindowTokenRateLimiter (X-RateLimit-* / 429 Retry-After)"]
-    Limiter --> Guard["RedactionGuard (API Key / Bearer / Email Scrub)"]
-    Guard --> Disp["McpJsonRpcDispatcher (2025-11-25 Batch + Tools + Resources + Prompts)"]
-    Disp -->|"moe_route_query / moe_sla_routing_plan"| Router["SparseTop2MoeRouter (VRAM + Latency SLA)"]
-    Disp -->|"rag_upsert / rag_hybrid_search / resources/read"| Vault["HybridKnowledgeVault (SQLite WAL)"]
-    Disp -->|"otlp_export_telemetry / GET /metrics/otlp"| OTLP["OtlpTelemetryExporter (W3C Spans + Histograms + Rate-Limit Counters)"]
-    Vault --> FTS["FTS5 BM25 + Highlighted Citation Spans"]
-    Vault --> Vec["L2 Dense N-Gram Vector Cosine"]
+    Client["Client (SDK / Web UI / Agent Host)"] -->|"POST/GET/DELETE /mcp (W3C traceparent)"| Limiter["SlidingWindowTokenRateLimiter"]
+    Limiter --> Guard["RedactionGuard"]
+    Guard --> Disp["McpJsonRpcDispatcher (MCP 2025-11-25)"]
+    Disp -->|"moe_route_query"| Router["SparseTop2MoeRouter"]
+    Disp -->|"rag_upsert_document / rag_hybrid_search"| Vault["HybridKnowledgeVault (SQLite WAL)"]
+    Disp -->|"otlp_export_telemetry / GET /metrics/otlp"| OTLP["OtlpTelemetryExporter"]
+    Vault --> FTS["FTS5 BM25"]
+    Vault --> Vec["Dense Vector Cosine"]
     FTS --> RRF["Reciprocal Rank Fusion (k=60)"]
     Vec --> RRF
 ```
 
----
-
-## Empirical Golden-Suite Benchmarks (`benchmarks/run_golden_eval.py`)
-
-| Subsystem | Golden Queries | Accuracy / Recall@1 | $p_{50}$ Latency | $p_{95}$ Latency | External Runtime Dependencies |
-| :--- | ---: | ---: | ---: | ---: | :--- |
-| **Hybrid RAG (`FTS5 BM25 + Vector RRF`)** | `100` | **`1.0000` (`100%`)** | **`0.2795 ms`** | **`0.4660 ms`** | `0` (Stdlib `sqlite3` `WAL` + `FTS5`) |
-| **Sparse Top-2 MoE Router (`4` Tiers)** | `100` | **`1.0000` (`100%`)** | **`0.0087 ms`** | **`0.0122 ms`** | `0` (Deterministic math + SLA guard) |
+| Layer | Implementation / Surface | Role |
+| :--- | :--- | :--- |
+| **Core Engine** | [`src/mcp_moe_sdk/engine.py`](src/mcp_moe_sdk/engine.py) | `McpJsonRpcDispatcher`, `SparseTop2MoeRouter`, `HybridKnowledgeVault`, `RedactionGuard`, `SlidingWindowTokenRateLimiter`, `OtlpTelemetryExporter` |
+| **HTTP + UI Server** | [`src/mcp_moe_sdk/server.py`](src/mcp_moe_sdk/server.py) | `ThreadingHTTPServer` serving `/` (Web UI), `/health`, `/mcp`, `/metrics/otlp`, `/mcp/notifications` |
+| **MCP Tools** | `tools/call` | `moe_route_query`, `rag_upsert_document`, `rag_hybrid_search`, `otlp_export_telemetry` |
+| **MCP Resources & Prompts** | `resources/list`, `prompts/list` | `mcp://moe-router/tiers`, `mcp://telemetry/otlp`, `mcp://governance/*`, `vault://documents/*`, `grounded_rag_answer`, `moe_sla_routing_plan` |
 
 ---
 
-## Quickstart
+## 30-Second Quickstart
 
-### 1. Local Install & Test Gate
+### Local Install & Server
+
 ```bash
-pip install -e .
-python -m unittest discover -s tests -v
-python benchmarks/run_golden_eval.py
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e ".[dev]"
+.venv/bin/python -m mcp_moe_sdk.server
+# Listens on http://127.0.0.1:8090 (override with MCP_HOST / MCP_PORT)
 ```
 
-### 2. Launch Full-Stack MCP Server + Interactive Bento Web Showcase
-```bash
-python -m mcp_moe_sdk.server
-# Open http://127.0.0.1:8090 for the interactive UI or query GET /health & POST /mcp
-```
+### Containerized Deployment
 
-### 3. Containerized Deployment
 ```bash
 docker build -t mcp-moe-hybrid-sdk:1.8.0 .
 docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.8.0
@@ -58,7 +62,33 @@ docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.8.0
 
 ---
 
-## Python SDK Usage
+## Sample CLI / MCP & Python SDK Usage
+
+### MCP HTTP (`curl`)
+
+```bash
+# 1. Health & governance snapshot
+curl -s http://127.0.0.1:8090/health
+
+# 2. Initialize MCP 2025-11-25 session (returns Mcp-Session-Id response header)
+curl -i -s -X POST http://127.0.0.1:8090/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}'
+
+# 3. Call Sparse Top-2 MoE router tool
+curl -s -X POST http://127.0.0.1:8090/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"moe_route_query","arguments":{"prompt":"Verify SQLite WAL FTS5 RRF"}}}'
+
+# 4. Call Hybrid RAG search tool
+curl -s -X POST http://127.0.0.1:8090/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rag_hybrid_search","arguments":{"query":"SQLite FTS5 RRF","top_k":3}}}'
+```
+
+Additional endpoints: `GET /metrics/otlp` exports OTLP/JSON telemetry, `GET /mcp` with `Mcp-Session-Id` + `Last-Event-ID` replays missed SSE events, and `DELETE /mcp` terminates an active session.
+
+### Python SDK
 
 ```python
 from mcp_moe_sdk import HybridKnowledgeVault, McpJsonRpcDispatcher, SparseTop2MoeRouter
@@ -86,7 +116,26 @@ resp = mcp.handle({
     "method": "tools/call",
     "params": {"name": "rag_hybrid_search", "arguments": {"query": "BM25 cosine RRF", "top_k": 3}},
 })
+print(resp["result"]["structuredContent"])
 ```
+
+---
+
+## Verified Test & Benchmark Commands
+
+Run the exact CI and Docker verification commands offline:
+
+```bash
+.venv/bin/ruff check .
+PYTHONPATH=src .venv/bin/pytest -q
+PYTHONPATH=src .venv/bin/python benchmarks/run_golden_eval.py
+```
+
+| Check | Scope | Verified Result |
+| :--- | :--- | :--- |
+| **Lint (`ruff`)** | Full repository | `All checks passed!` |
+| **Test Suite (`pytest`)** | Offline unit, protocol & edge-case tests | `40 passed` |
+| **Golden Eval (`benchmarks/run_golden_eval.py`)** | `100` RAG queries + `100` MoE routing queries (`0` external deps) | `1.0000` (`100%`) Recall@1 (`0.2396 ms` p50 / `0.3762 ms` p95); `1.0000` (`100%`) Router Accuracy (`0.0081 ms` p50 / `0.0123 ms` p95); latencies vary by hardware |
 
 ---
 
