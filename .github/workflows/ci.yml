@@ -12,8 +12,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install SDK & Run Unit + Golden Benchmarks
+      - uses: astral-sh/setup-uv@v5
+      - name: Install SDK & Dev Tools
         run: |
-          pip install -e .
-          python -m unittest discover -s tests -v
-          python benchmarks/run_golden_eval.py
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e ".[dev]"
+      - name: Lint (ruff)
+        run: .venv/bin/ruff check .
+      - name: Test Suite (pytest)
+        run: PYTHONPATH=src .venv/bin/pytest -q
+      - name: Golden Evaluation Benchmark
+        run: PYTHONPATH=src .venv/bin/python benchmarks/run_golden_eval.py

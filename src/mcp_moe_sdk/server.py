@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -494,6 +495,8 @@ def build_server(
 
 
 if __name__ == "__main__":
-    srv = build_server()
-    print("Serving mcp-moe-hybrid-sdk on http://127.0.0.1:8090")
+    host = os.environ.get("MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("MCP_PORT", "8090"))
+    srv = build_server(host=host, port=port)
+    print(f"Serving mcp-moe-hybrid-sdk on http://{host}:{port}")
     srv.serve_forever()
