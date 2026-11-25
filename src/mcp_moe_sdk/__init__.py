@@ -1,24 +1,52 @@
 """mcp-moe-hybrid-sdk: MCP 2025-11-25 + Sparse Top-2 MoE Router + SQLite WAL Hybrid RAG."""
 
 from .engine import (
+    CancellationToken,
+    ContentAnnotationGuard,
+    ElicitationSchemaGuard,
+    HumanApprovalRegistry,
     HybridKnowledgeVault,
+    JsonSchema2020Validator,
+    McpCursorCodec,
     McpJsonRpcDispatcher,
     OtlpTelemetryExporter,
+    ProgressReporter,
+    ProgressTokenRegistry,
     RedactionGuard,
+    RequestCancellationRegistry,
+    RequestCancelledError,
+    SamplingGovernanceGuard,
     SearchHit,
     SlidingWindowTokenRateLimiter,
     SparseTop2MoeRouter,
+    StreamableSessionRegistry,
+    WorkspaceRootsGuard,
+    crc32c,
     estimate_mcp_tokens,
 )
 
 __all__ = [
+    "CancellationToken",
+    "ContentAnnotationGuard",
+    "ElicitationSchemaGuard",
+    "HumanApprovalRegistry",
     "HybridKnowledgeVault",
+    "JsonSchema2020Validator",
+    "McpCursorCodec",
     "McpJsonRpcDispatcher",
     "OtlpTelemetryExporter",
+    "ProgressReporter",
+    "ProgressTokenRegistry",
     "RedactionGuard",
+    "RequestCancellationRegistry",
+    "RequestCancelledError",
+    "SamplingGovernanceGuard",
     "SearchHit",
     "SlidingWindowTokenRateLimiter",
     "SparseTop2MoeRouter",
+    "StreamableSessionRegistry",
+    "WorkspaceRootsGuard",
+    "crc32c",
     "estimate_mcp_tokens",
 ]
-__version__ = "1.3.0"
+__version__ = "1.8.0"

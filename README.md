@@ -4,7 +4,7 @@
 [![MCP Spec](https://img.shields.io/badge/MCP-2025--11--25-blue.svg)](https://modelcontextprotocol.io/specification/2025-11-25)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)](pyproject.toml)
 
-Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` Streamable HTTP JSON-RPC 2.0 Batching, Tools, Resources & Prompts)**, **W3C `traceparent` Distributed Trace Propagation + OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, **Deterministic Sliding-Window Token-Budget Rate Limiting (`X-RateLimit-*` / `Retry-After`)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 Highlighted Citation Spans + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, and **Deterministic Secret/PII Redaction**.
+Production-grade, zero-bloat Python AI SDK & Full-Stack Server uniting **Model Context Protocol (`MCP 2025-11-25` Streamable HTTP JSON-RPC 2.0 Batching, `Mcp-Session-Id` Cryptographic Binding + `Last-Event-ID` SSE Event-Ring Replay (`-36`..`-41`) + `DELETE /mcp` Termination, `ResourceLink` & `Annotations` (`audience`, `priority`, leap-year ISO-8601 `lastModified`) `21 B` `CRC32C` Provenance Sealing (`-42`), `elicitation/create` Flat-Schema & `sampling/createMessage` Human-in-the-Loop Governance (`-29`..`-35`), `_meta.progressToken` Monotonic `notifications/progress` Streaming, `roots/list` RFC 8089 Canonical `file://` URI Confinement, C11-Identical `CRC32C` Cursor Pagination across `tools/resources/prompts`, `completion/complete` Autocomplete, `resources/subscribe` Change Notifications, RFC 5424 `logging/setLevel`, `ToolAnnotations`, JSON-Schema `2020-12` `inputSchema`/`outputSchema` `structuredContent` Validation & Cooperative `notifications/cancelled` Tokens)**, **W3C `traceparent` Distributed Trace Propagation + Castagnoli `CRC32C` Deterministic Child-Span Derivation + OpenTelemetry (`OTLP/JSON`) Span & Histogram Export**, **Deterministic Sliding-Window Token-Budget Rate Limiting (`X-RateLimit-*` / `Retry-After`)**, **Hardware- & SLA-Aware Sparse Top-2 Mixture-of-Experts (`MoE`) Query Routing**, **SQLite `WAL` + `FTS5` BM25 Highlighted Citation Spans + Cosine Vector Reciprocal Rank Fusion (`RRF`) Hybrid RAG**, and **Deterministic Secret/PII Redaction**.
 
 ---
 
@@ -52,8 +52,8 @@ python -m mcp_moe_sdk.server
 
 ### 3. Containerized Deployment
 ```bash
-docker build -t mcp-moe-hybrid-sdk:1.3.0 .
-docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.3.0
+docker build -t mcp-moe-hybrid-sdk:1.8.0 .
+docker run --rm -p 8090:8090 mcp-moe-hybrid-sdk:1.8.0
 ```
 
 ---
