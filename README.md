@@ -4,16 +4,16 @@
 [![MCP Spec](https://img.shields.io/badge/MCP-2025--11--25-blue.svg)](https://modelcontextprotocol.io/specification/2025-11-25)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)](pyproject.toml)
 
-A zero-dependency Python SDK and HTTP server uniting an **MCP `2025-11-25` Streamable JSON-RPC 2.0 server**, a **hardware- and SLA-aware Sparse Top-2 MoE router**, and an **embedded SQLite WAL (`FTS5` BM25 + dense vector cosine RRF) Hybrid RAG engine**. Designed for deterministic local evaluation, strict governance, and single-container deployment without external vector databases or API keys.
+A Python SDK and HTTP server with zero external runtime dependencies, uniting an **MCP `2025-11-25` Streamable JSON-RPC 2.0 server**, a **hardware and SLA aware Sparse Top-2 MoE router**, and an **embedded SQLite WAL (`FTS5` BM25 + dense vector cosine RRF) Hybrid RAG engine**. Built for local evaluation, governance enforcement, and single-container deployment without external vector databases or API keys.
 
 ---
 
 ## Problem Solved
 
-- **Zero External Runtime Dependencies**: Runs entirely on Python 3.10+ stdlib and embedded SQLite `WAL`/`FTS5`—no external vector DB, Redis, or orchestration cluster required.
-- **Deterministic VRAM & Latency-SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
-- **Built-In Production Governance**: Enforces secret/PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`OAuthProtectedResourceGuard` RFC 9728 `/.well-known/oauth-protected-resource`, RFC 7636 `PKCE S256`, & RFC 8707/6750 audience-bound `Bearer` introspection, `Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
-- **Offline Determinism**: Every unit test, protocol check, and golden-dataset benchmark runs deterministically offline with zero external API keys.
+- **Zero External Runtime Dependencies**: Runs entirely on Python 3.10+ stdlib and embedded SQLite `WAL`/`FTS5` with no external vector DB, Redis, or orchestration cluster required.
+- **Deterministic VRAM & Latency SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
+- **Built-In Production Governance**: Enforces secret and PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`OAuthProtectedResourceGuard` RFC 9728 `/.well-known/oauth-protected-resource`, RFC 7636 `PKCE S256`, & RFC 8707/6750 audience-bound `Bearer` introspection, `Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
+- **Offline Determinism**: Every unit test, protocol check, and golden dataset benchmark runs deterministically offline with zero external API keys.
 
 ---
 

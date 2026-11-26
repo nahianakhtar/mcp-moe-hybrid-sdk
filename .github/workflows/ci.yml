@@ -19,6 +19,8 @@ jobs:
           uv pip install --python .venv/bin/python -e ".[dev]"
       - name: Lint (ruff)
         run: .venv/bin/ruff check .
+      - name: Type Check (mypy strict)
+        run: .venv/bin/mypy --strict src
       - name: Test Suite (pytest)
         run: PYTHONPATH=src .venv/bin/pytest -q
       - name: Golden Evaluation Benchmark

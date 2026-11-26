@@ -1525,7 +1525,8 @@ class JsonSchema2020Validator:
                                 "message": f"Missing required property '{req_key}'",
                             }
                         )
-            props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+            raw_props = schema.get("properties")
+            props: dict[str, Any] = raw_props if isinstance(raw_props, dict) else {}
             addl = schema.get("additionalProperties", True)
             for k, v in instance.items():
                 child_path = f"{path}.{k}"
@@ -4781,7 +4782,8 @@ class McpJsonRpcDispatcher:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32600, "message": "Invalid JSON-RPC 2.0 Request"}}
 
         method = req["method"]
-        params = req.get("params") if isinstance(req.get("params"), dict) else {}
+        raw_params = req.get("params")
+        params: dict[str, Any] = raw_params if isinstance(raw_params, dict) else {}
 
         if method == "notifications/cancelled":
             target_id = params.get("requestId")
@@ -4795,7 +4797,8 @@ class McpJsonRpcDispatcher:
 
         token = self.cancellation.begin(req_id, non_cancellable=(method == "initialize"))
         reporter: ProgressReporter | None = None
-        req_meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        raw_meta = params.get("_meta")
+        req_meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
         try:
             token.raise_if_cancelled()
 
