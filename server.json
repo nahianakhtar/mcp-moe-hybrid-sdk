@@ -1,0 +1,16 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
+  "name": "io.github.nahianakhtar/mcp-moe-hybrid-sdk",
+  "description": "Pure Python 3.12 MCP 2025-11-25 Streamable HTTP server with OAuth 2.1 RFC 9728 PKCE S256, Sparse Top-2 MoE routing, and SQLite FTS5 BM25 + cosine RRF.",
+  "version": "1.9.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-moe-hybrid-sdk",
+      "version": "1.9.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
