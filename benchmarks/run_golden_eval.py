@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Deterministic golden-dataset benchmark measuring Recall@1, Router Accuracy, and p50/p95 latencies."""
 
 from __future__ import annotations

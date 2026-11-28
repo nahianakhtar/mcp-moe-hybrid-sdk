@@ -11,9 +11,9 @@ A Python SDK and HTTP server with zero external runtime dependencies, uniting an
 ## Problem Solved
 
 - **Zero External Runtime Dependencies**: Runs entirely on Python 3.10+ stdlib and embedded SQLite `WAL`/`FTS5` with no external vector DB, Redis, or orchestration cluster required.
-- **Deterministic VRAM & Latency SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
+- **VRAM & Latency SLA Routing**: Routes prompts across 4 expert tiers (`edge_fast_json`, `rag_grounded_synthesis`, `code_and_systems_verifier`, `frontier_moe_math_architect`) under configurable VRAM and latency budgets.
 - **Built-In Production Governance**: Enforces secret and PII redaction (`RedactionGuard`), sliding-window request/token rate limiting (`X-RateLimit-*`, HTTP `429 Retry-After`), W3C `traceparent` + OTLP/JSON telemetry, and MCP `2025-11-25` controls (`OAuthProtectedResourceGuard` RFC 9728 `/.well-known/oauth-protected-resource`, RFC 7636 `PKCE S256`, & RFC 8707/6750 audience-bound `Bearer` introspection, `Mcp-Session-Id` + `Last-Event-ID` SSE replay, `roots/list` `file://` confinement, `elicitation`/`sampling` HITL checks, JSON-Schema 2020-12 `outputSchema` validation, cooperative `notifications/cancelled`).
-- **Offline Determinism**: Every unit test, protocol check, and golden dataset benchmark runs deterministically offline with zero external API keys.
+- **Offline Reproducibility**: Every unit test, protocol check, and golden dataset benchmark runs reproducibly offline with zero external API keys.
 
 ---
 
@@ -35,8 +35,8 @@ flowchart LR
 
 | Layer | Implementation / Surface | Role |
 | :--- | :--- | :--- |
-| **Core Engine** | [`src/mcp_moe_sdk/engine.py`](src/mcp_moe_sdk/engine.py) | `McpJsonRpcDispatcher`, `SparseTop2MoeRouter`, `HybridKnowledgeVault`, `RedactionGuard`, `SlidingWindowTokenRateLimiter`, `OtlpTelemetryExporter` |
-| **HTTP + UI Server** | [`src/mcp_moe_sdk/server.py`](src/mcp_moe_sdk/server.py) | `ThreadingHTTPServer` serving `/` (Web UI), `/health`, `/mcp`, `/metrics/otlp`, `/mcp/notifications` |
+| **Core Engine** | [`src/mcp_moe_sdk/engine.py`](https://github.com/nahianakhtar/mcp-moe-hybrid-sdk/blob/main/src/mcp_moe_sdk/engine.py) | `McpJsonRpcDispatcher`, `SparseTop2MoeRouter`, `HybridKnowledgeVault`, `RedactionGuard`, `SlidingWindowTokenRateLimiter`, `OtlpTelemetryExporter` |
+| **HTTP + UI Server** | [`src/mcp_moe_sdk/server.py`](https://github.com/nahianakhtar/mcp-moe-hybrid-sdk/blob/main/src/mcp_moe_sdk/server.py) | `ThreadingHTTPServer` serving `/` (Web UI), `/health`, `/mcp`, `/metrics/otlp`, `/mcp/notifications` |
 | **MCP Tools** | `tools/call` | `moe_route_query`, `rag_upsert_document`, `rag_hybrid_search`, `otlp_export_telemetry` |
 | **MCP Resources & Prompts** | `resources/list`, `prompts/list` | `mcp://moe-router/tiers`, `mcp://telemetry/otlp`, `mcp://governance/*`, `vault://documents/*`, `grounded_rag_answer`, `moe_sla_routing_plan` |
 
